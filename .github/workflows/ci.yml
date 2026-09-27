@@ -61,6 +61,11 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - name: 创建 vcan 并运行显式集成测试
         run: |
+          if ! modinfo vcan >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+          fi
+          sudo modprobe vcan
           sudo ip link add dev odrive-vcan type vcan
           sudo ip link set odrive-vcan up
           trap 'sudo ip link delete dev odrive-vcan' EXIT

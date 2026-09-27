@@ -1,4 +1,5 @@
 # Copyright The odrive-can-driver Contributors
+# 选择 H723 目标与链接参数；硬件刷写由主机显式执行。
 
 [build]
 target = "thumbv7em-none-eabihf"
