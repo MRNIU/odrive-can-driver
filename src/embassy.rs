@@ -1,21 +1,13 @@
 // Copyright The odrive-can-driver Contributors
-//! Embassy STM32 名义 0.6.0 的 FDCAN 原生异步适配。
+//! Embassy STM32 的 FDCAN 原生异步适配。
 //!
-//! 本模块面向具有 FDCAN 的芯片；首个验证目标为 STM32H723。它直接使用 Embassy 的
-//! `Can::write` 与 `Can::read_fd`，因此不把 bxCAN 的 `TransmitStatus` API 伪装成 FDCAN
-//! 的可替换队列。应用负责配置外设、统一共享总线调度和为 `received_at_ms` 提供单调时钟。
+//! 本模块面向具有 FDCAN 的芯片，直接使用 Embassy 的 `Can::write` 与 `Can::read_fd`。
+//! 应用负责配置外设、统一共享总线调度和为 `received_at_ms` 提供单调时钟。
 //!
-//! 消费方工作区根必须将 `embassy-stm32`、`embassy-executor`、`embassy-time`、
-//! `embassy-sync`、`embassy-usb` 和 `embassy-futures` 全部 patch 到 Embassy Git revision
-//! `7b08a9c7d9a9fe620f4be25c4e7b86dd29f09f54`。crates.io 的 `embassy-stm32 0.6.0` 只在
-//! `header.len() == 0` 时设置 FDCAN RTR 位；CANSimple 查询使用 DLC 8，故该 registry
-//! 版本会将查询作为数据帧发送，不能作为完整 RTR 可用组合。此 revision 以
-//! `header.rtr()` 保留 RTR 位。Cargo 发布不会把 library 的 patch 传递给消费方。
-//!
-//! docs.rs 仅生成 API 文档；它不证明 patch 已在消费方生效，也不验证任何实际 CAN 总线行为。
-//! 当前固定 Git H723 组合以 Rust 1.98.1 验证；Rust 1.89 的 target check 会在传递
-//! `xarxa-driver` 的 `cfg_select!` 处失败。未为寻找真实 MSRV 对版本做二分，因此不要将
-//! 默认/`embedded-can` 的 Rust 1.85 或 SocketCAN 的 Rust 1.89 外推到此组合。
+//! 消费方工作区根必须将 `embassy-stm32` patch 到 Embassy Git revision
+//! `7b08a9c7d9a9fe620f4be25c4e7b86dd29f09f54`，配置见仓库 README。
+//! crates.io 的 `embassy-stm32 0.6.0` 仅在 DLC 为 0 时设置 FDCAN RTR 位，而 CANSimple
+//! 查询使用 DLC 8；该修订正确保留 RTR 位。Cargo 不向消费方传递 library 的 patch。
 
 use embassy_stm32::can::{
     Can,
