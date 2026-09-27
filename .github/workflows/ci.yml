@@ -1,0 +1,102 @@
+# Copyright The odrive-can-driver Contributors
+# 检查默认 no_std 核心、各真实 I/O 后端及其适用的 Rust/目标组合，不执行发布或实板操作。
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  default:
+    name: 默认核心与文档
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: thumbv6m-none-eabi, thumbv7em-none-eabihf
+      - run: cargo fmt --check
+      - run: cargo test --locked --all-targets
+      - run: cargo test --locked --doc
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo doc --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo build --locked --lib --target thumbv6m-none-eabi
+      - run: cargo build --locked --lib --target thumbv7em-none-eabihf
+      - run: cargo package --locked
+
+  embedded_can:
+    name: embedded-can 与 MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: clippy
+          targets: thumbv7em-none-eabihf
+      - run: cargo check --locked --lib
+      - run: cargo check --locked --lib --features embedded-can
+      - run: cargo test --locked --all-targets --features embedded-can
+      - run: cargo clippy --locked --all-targets --features embedded-can -- -D warnings
+      - run: cargo check --locked --lib --target thumbv7em-none-eabihf --features embedded-can
+
+  socketcan:
+    name: Linux SocketCAN
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: clippy
+      - run: cargo test --locked --all-targets --features socketcan
+      - run: cargo clippy --locked --all-targets --features socketcan -- -D warnings
+      - run: cargo doc --locked --no-deps --features socketcan
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: 创建 vcan 并运行显式集成测试
+        run: |
+          sudo ip link add dev odrive-vcan type vcan
+          sudo ip link set odrive-vcan up
+          trap 'sudo ip link delete dev odrive-vcan' EXIT
+          cargo test --locked --features socketcan --test socketcan -- --ignored
+
+  embassy_h723:
+    name: Embassy STM32H723
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: clippy
+          targets: thumbv7em-none-eabihf
+      - run: >-
+          cargo test --locked --test embassy
+          --features embassy-stm32,embassy-stm32/stm32h723vg
+      - run: >-
+          cargo check --locked --lib --target thumbv7em-none-eabihf
+          --features embedded-can,embassy-stm32,embassy-stm32/stm32h723vg
+      - run: >-
+          cargo clippy --locked --lib --target thumbv7em-none-eabihf
+          --features embedded-can,embassy-stm32,embassy-stm32/stm32h723vg -- -D warnings
+      - run: >-
+          cargo doc --locked --no-deps --target thumbv7em-none-eabihf
+          --features embedded-can,embassy-stm32,embassy-stm32/stm32h723vg
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  h723_bench:
+    name: STM32H723 台架应用构建
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+      - run: cargo build --locked --release
+        working-directory: examples/h723-bench

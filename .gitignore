@@ -1,0 +1,7 @@
+# Copyright The odrive-can-driver Contributors
+# 排除构建目录和本地测试证据、凭据。
+/target/
+**/target/
+.local/
+.env
+__pycache__/

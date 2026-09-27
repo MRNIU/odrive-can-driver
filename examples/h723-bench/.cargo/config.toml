@@ -1,0 +1,10 @@
+# Copyright The odrive-can-driver Contributors
+
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+rustflags = [
+  "-C", "target-cpu=cortex-m7",
+  "-C", "link-arg=-Tlink.x",
+]
