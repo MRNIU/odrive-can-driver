@@ -45,6 +45,9 @@ jobs:
       - run: cargo test --locked --all-targets --features embedded-can
       - run: cargo clippy --locked --all-targets --features embedded-can -- -D warnings
       - run: cargo check --locked --lib --target thumbv7em-none-eabihf --features embedded-can
+      - run: >-
+          cargo check --locked --example embedded_can --target thumbv7em-none-eabihf
+          --features embedded-can
 
   socketcan:
     name: Linux SocketCAN
@@ -86,6 +89,9 @@ jobs:
       - run: >-
           cargo check --locked --lib --target thumbv7em-none-eabihf
           --features embedded-can,embassy-stm32,embassy-stm32/stm32h723vg
+      - run: >-
+          cargo check --locked --example embassy_stm32 --target thumbv7em-none-eabihf
+          --features embassy-stm32,embassy-stm32/stm32h723vg
       - run: >-
           cargo clippy --locked --lib --target thumbv7em-none-eabihf
           --features embedded-can,embassy-stm32,embassy-stm32/stm32h723vg -- -D warnings

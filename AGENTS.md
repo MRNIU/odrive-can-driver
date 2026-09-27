@@ -11,5 +11,4 @@
 - 文档与 rustdoc 使用中文，标识符使用英文；精确 API 前提、时间单位、watchdog 影响和结果语义由 rustdoc 维护。
 - 每个文件开头保留 `Copyright The odrive-can-driver Contributors` 与职责说明；改编代码保留适用原版权。保留现有 MIT LICENSE。
 - 测试真实行为，不重建协议字节测试矩阵。区分受控软件测试、Linux vcan 和真实设备测试，不把软件注入声称为物理 Bus-Off。
-- 本机开发优先 devbox，设备访问在连接设备的主机执行。对未修改的输入不重复验证；每次追加验证必须解决具体疑点。
 - 精确暂存；中文 Conventional Commits，`git commit --signoff`，AI 协作添加 `Co-authored-by: OpenAI Codex <codex@openai.com>`。不提交凭据或无关产物。

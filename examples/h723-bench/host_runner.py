@@ -178,9 +178,11 @@ def main() -> int:
         ],
     )
     parser.add_argument("--port", help="CDC device path; autodetection matches the bench USB product")
-    parser.add_argument("--odrive-serial", default="327834523034", help="ODrive Fibre USB serial")
+    parser.add_argument("--odrive-serial", help="ODrive Fibre USB serial; required for fault and motion")
     parser.add_argument("--baud", type=int, default=115200, help="CDC terminal setting; USB CDC ignores line rate")
     args = parser.parse_args()
+    if any(scene == "fault" or scene.startswith("motion") for scene in args.scenes) and not args.odrive_serial:
+        parser.error("fault and motion require an explicit --odrive-serial")
 
     commands = {
         "motion+": "motion +",

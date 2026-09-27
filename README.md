@@ -1,185 +1,127 @@
 <!-- Copyright The odrive-can-driver Contributors -->
-<!-- 本文件说明驱动的产品边界、兼容范围、安装与操作结果语义。 -->
+<!-- 说明安装、常用操作和异常处理；后端接入与时序统一放在 examples。 -->
 
 # odrive-can-driver
 
 [![CI](https://github.com/MRNIU/odrive-can-driver/actions/workflows/ci.yml/badge.svg)](https://github.com/MRNIU/odrive-can-driver/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/odrive_can_driver.svg)](https://crates.io/crates/odrive_can_driver)
 [![docs.rs](https://docs.rs/odrive_can_driver/badge.svg)](https://docs.rs/odrive_can_driver)
-[![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/MRNIU/odrive-can-driver/blob/main/LICENSE)
+[![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0/)
 
-`odrive_can_driver`（仓库名 `odrive-can-driver`）是面向 ODrive CANSimple 的无分配驱动库。它在 `odrive-can-protocol 0.1.2` 的编解码之上记录单节点操作的本地提交、观察到的查询反馈、超时和副作用未知状态，并提供 `embedded-can`、Embassy STM32 与 Linux SocketCAN 的真实 I/O 后端。
+`odrive_can_driver` 是 ODrive CANSimple 驱动库。共享 `Driver` 管理单节点的命令、查询、反馈缓存、操作身份、期限和发送结果；三个可选后端负责实际收发。默认 `no_std`、无动态分配，使用已发布的 `odrive-can-protocol 0.1.2` 编解码与帧适配。
 
-默认构建使用 Rust 2024、`#![no_std]`、无 `alloc`，仅依赖 `odrive-can-protocol 0.1.2`；核心 MSRV 为 Rust 1.85。该库不配置 CAN 芯片、时钟、引脚或位速率，也不决定机械限值、保护许可和设备恢复策略。
-
-## 安装与后端
-
-Rust 中的 crate 名为 `odrive_can_driver`，协议类型从 `odrive_can_driver::protocol` 导入。完整 API、参数前提、毫秒时钟和每个错误的副作用语义见 [rustdoc](https://docs.rs/odrive_can_driver)。
+## 安装
 
 ```toml
 [dependencies]
-odrive_can_driver = "0.1.0"
+odrive_can_driver = { version = "0.1.0", features = ["embedded-can"] }
 ```
 
-| feature | 最小依赖配置 | 真实 I/O 与运行环境 |
-|---|---|---|
-| `embedded-can` | `odrive_can_driver = { version = "0.1.0", features = ["embedded-can"] }` | `embedded-can 0.4` 的 blocking 与 `nb` 接口；调用方拥有外设和总线调度。 |
-| `embassy-stm32` | `odrive_can_driver = { version = "0.1.0", features = ["embassy-stm32"] }`，另加名义 `0.6.0` 的 `embassy-stm32` 及下文固定 revision patch | 原生异步 FDCAN；首版以 STM32H723 为目标，应用选择芯片、时钟、引脚与 CAN 配置；当前最低已验证 Rust 1.98.1。 |
-| `socketcan` | `odrive_can_driver = { version = "0.1.0", features = ["socketcan"] }`；下例直接配置错误过滤器还需 `socketcan = { version = "4", default-features = false }` | Linux `socketcan 4` 的非阻塞套接字，不引入 Tokio 或其他运行时；MSRV 为 Rust 1.89。 |
+按接入方式选择 feature；只使用共享状态机时可省略 `features`，默认是 `[]`。
 
-Embassy 的芯片 feature 由消费方选择；表中的 H723 仅是当前目标组合。SocketCAN 仅在 Linux 上可用。每个后端的最小可运行消费方、设备前提和命令见 [examples/README.md](examples/README.md)；Linux 可直接运行一次 [`socketcan_query`](examples/socketcan_query.rs) 母线电压 RTR 查询。
+| feature | 接入方式 | Rust 要求 | 使用入口 |
+|---|---|---|---|
+| `embedded-can` | 实现 `embedded-can 0.4` 的 HAL，blocking 或非阻塞轮询 | 1.85 | [轮询示例与时序](examples/README.md#embedded-can) |
+| `embassy-stm32` | 已配置的 STM32 FDCAN，原生异步收发 | 固定依赖组合已验证 1.98.1 | [依赖配置、异步示例与时序](examples/README.md#embassy-stm32) |
+| `socketcan` | Linux 非阻塞 SocketCAN，无异步运行时 | 1.89 | [命令行示例与时序](examples/README.md#socketcan) |
 
-### Embassy STM32H723：完整 RTR 可用配置
+**Embassy 必须使用示例指南中的 workspace patch**：registry `embassy-stm32 0.6.0` 存在 RTR DLC 8 发送缺陷；已验证的 Git revision 修复了它。Cargo 不会向消费方传递本库的 patch。
 
-Embassy 依赖在消费方工作区根声明为名义 `0.6.0`，并且**必须**以 EHA 已使用的固定 revision 覆盖六个包。Cargo 发布不会把本库的 `[patch.crates-io]` 传递给下游，因此只启用本库的 `embassy-stm32` feature 不是完整 RTR 可用组合；将下列内容复制到消费方工作区根的 `Cargo.toml`：
+## 一次操作怎样完成
 
-```toml
-[dependencies]
-odrive_can_driver = { version = "0.1.0", features = ["embassy-stm32"] }
-embassy-stm32 = { version = "0.6.0", features = ["stm32h723vg"] }
+1. 为设备节点创建 `Driver::new(NodeId::new(node)?)`。
+2. 用 `prepare_command` 或 `prepare_query` 准备操作，取得 `OperationId`。这一步只验证和编码，没有发送。
+3. 调用对应后端的发送函数；它内部完成 `begin_send` 和发送结果记录。
+4. 持续接收并分发帧，同时用 `tick(now_ms)` 推进期限。接收会更新缓存，匹配的查询反馈可使操作成为 `Observed`。
+5. 用 `report(id)` 查看进展；终态后 `take_report(id)` 取走报告，再开始下一操作。`Unknown` 有额外处理要求，见下文。
 
-[patch.crates-io]
-embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", rev = "7b08a9c7d9a9fe620f4be25c4e7b86dd29f09f54" }
-embassy-executor = { git = "https://github.com/embassy-rs/embassy", rev = "7b08a9c7d9a9fe620f4be25c4e7b86dd29f09f54" }
-embassy-time = { git = "https://github.com/embassy-rs/embassy", rev = "7b08a9c7d9a9fe620f4be25c4e7b86dd29f09f54" }
-embassy-sync = { git = "https://github.com/embassy-rs/embassy", rev = "7b08a9c7d9a9fe620f4be25c4e7b86dd29f09f54" }
-embassy-usb = { git = "https://github.com/embassy-rs/embassy", rev = "7b08a9c7d9a9fe620f4be25c4e7b86dd29f09f54" }
-embassy-futures = { git = "https://github.com/embassy-rs/embassy", rev = "7b08a9c7d9a9fe620f4be25c4e7b86dd29f09f54" }
-```
+一个 `Driver` 只有一个操作槽，**未取走的终态报告也占用它**。所有时刻以同一单调时钟的毫秒值表示，`deadline_ms` 是绝对期限。例如当前 `1000`、期限 `1100` 表示剩余 100 ms；反馈必须在提交后且严格早于期限才参与查询完成判断。
 
-crates.io 的 `embassy-stm32 0.6.0` 未包含此修复：FDCAN 发送 RTR 时仅在 `header.len() == 0` 设置 RTR 位，而 CANSimple RTR 查询使用 DLC 8，结果会被发送为数据帧，ODrive `fw-v0.5.1` 不会返回查询回复。固定 revision 使用 `header.rtr()` 保留该 RTR 位。不要把 registry `0.6.0` 单独称为完整 RTR 可用配置。
+## 发心跳、读状态与保活
 
-固定 Git Embassy H723 组合当前以 Rust 1.98.1 验证；这不是已穷尽版本二分的真实 MSRV 声明。Rust 1.89 的 target check 当前会在传递依赖 `xarxa-driver` 的 `cfg_select!` 处失败。该限制独立于默认/`embedded-can` 的 Rust 1.85 与 SocketCAN 的 Rust 1.89 支持。
-
-[docs.rs](https://docs.rs/odrive_can_driver) 只展示公开 API；它不验证真实总线行为，也不替消费方工作区应用上述 patch。
-
-已准备的 `id`、调用方拥有的 `driver` 和同一单调时钟域的时刻是下列后端调用共同前提。后端只执行一次真实 I/O，并把本地结果回写给 `Driver`；发送端以外的总线策略仍由应用持有。
+**Heartbeat 由 ODrive 周期发送，主机接收。** 当前协议没有 `Command::Heartbeat` 或 `Query::Heartbeat`；本库不伪造设备心跳，也不配置设备心跳周期。先在设备端配置周期，随后持续调用后端接收函数，读取缓存中的轴状态、完整错误位和接收时间：
 
 ```rust
-use odrive_can_driver::embedded_can::{NbReceive, NbTransmit, receive_nb, transmit_nb};
+use odrive_can_driver::{Driver, ResponseKind, protocol::{AxisState, Response}};
 
-match transmit_nb(&mut driver, id, &mut can, || monotonic_ms())? {
-    NbTransmit::Submitted { displaced } => hand_back_to_bus_owner(displaced),
-    NbTransmit::WouldBlock => schedule_same_operation_again(id),
-    NbTransmit::Uncertain { displaced, error } => {
-        hand_back_to_bus_owner(displaced);
-        record_unknown(id, error);
+fn fresh_axis_state(driver: &Driver, now_ms: u64, max_age_ms: u64)
+    -> Option<(AxisState, u32)>
+{
+    if !driver.cache().heartbeat_is_fresh(now_ms, max_age_ms) {
+        return None;
     }
-}
-match receive_nb(&mut driver, &mut can, || monotonic_ms())? {
-    NbReceive::Frame { frame, classification } => {
-        record_protocol_result(classification);
-        hand_back_to_bus_owner(Some(frame));
-    }
-    NbReceive::Empty => {}
-}
-```
-
-`embedded_can::transmit_blocking` 和 `receive_blocking` 提供同一状态语义的 blocking 入口；blocking 调用没有标准 trait 提供的可取消期限，不能把调用取消当作未发送。`transmit_nb` 的原生 I/O 错误也不能证明帧未提交，因此 guard 析构后为 `Unknown`。
-
-```rust
-use odrive_can_driver::embassy::{EmbassyReceive, receive_with_timestamp, transmit};
-
-let tx = transmit(&mut fdcan, &mut driver, id, || monotonic_ms()).await?;
-handle_embassy_transmit(tx);
-let rx = receive_with_timestamp(&mut fdcan, &mut driver, timestamp_to_ms).await?;
-match rx {
-    EmbassyReceive::Frame { frame, classification } => {
-        record_protocol_result(classification);
-        hand_back_to_bus_owner(Some(frame));
-    }
-    EmbassyReceive::Invalid { frame, error } => {
-        record_frame_error(error);
-        hand_back_to_bus_owner(Some(frame));
+    match driver.cache().get(ResponseKind::Heartbeat)?.response {
+        Response::Heartbeat { axis_state, axis_error } => Some((axis_state, axis_error)),
+        _ => None,
     }
 }
 ```
 
-`fdcan` 是应用已经配置好的 `embassy_stm32::can::Can`；`transmit` 的闭包在异步写入前后读取同一单调毫秒时钟。`timestamp_to_ms` 必须将 `FdEnvelope` 的硬件时间映射到该时钟域。
+`None` 表示没有可用的新鲜状态，不能当作 Idle 或无错误。非零 `axis_error` 是设备错误位图；未知位也保留。`max_age_ms` 由应用根据设备发送周期和允许的延迟设置。
+
+如果“发心跳”指**主机保活**，应用可以按自己的调度周期调用 `prepare_query(Query::VbusVoltage, now_ms, deadline_ms)`，再通过后端真正发出并处理报告。在支持的 v0.5.1 固件中，寻址到该轴的 CANSimple 帧（包含 RTR 查询）会喂 watchdog。因此查询也会延长 watchdog，不能把持续查询后的存活误认为控制任务仍健康。库不创建后台保活任务；查询周期和 watchdog 超时由应用明确配置，上一操作结束并取走报告后才准备下一次。
+
+## 发指令、查询数据、清错误
+
+下面的值直接来自 `odrive_can_driver::protocol`。写指令传给 `prepare_command`，读取请求传给 `prepare_query`，两者随后都使用同一个后端发送入口。
+
+| 目的 | 传入值 | 如何确认后续状态 |
+|---|---|---|
+| 请求停止输出/Idle | `Command::SetAxisRequestedState { state: AxisState::IDLE }` | 继续接收，要求提交后新的 Heartbeat 显示 Idle；机械停止还需应用自己的反馈判据 |
+| 请求闭环 | `Command::SetAxisRequestedState { state: AxisState::CLOSED_LOOP_CONTROL }` | 在应用许可、标定和目标已准备的前提下发送，再观察新的状态与错误 |
+| 设置速度 | `Command::SetInputVel { velocity, torque_ff }` | 单位分别为 turn/s、N·m；读 `EncoderEstimates` 观察实际运动 |
+| 设置位置 | `Command::SetInputPos { position, velocity_ff, torque_ff }` | position 为 turn；两个前馈是原始 `i16`，每计数分别为 0.001 turn/s、0.001 N·m |
+| 设置转矩 | `Command::SetInputTorque { torque }` | 单位 N·m；不隐式切换控制模式 |
+| 设置控制/输入模式 | `Command::SetControllerModes { control_mode, input_mode }` | 两个字段是固件定义的原始模式值，应用选择适用组合 |
+| 清错误 | `Command::ClearErrors` | 观察新的 Heartbeat，并按需重新查询各子系统错误；故障原因仍存在时可能再次报错 |
+| 急停故障请求 | `Command::Estop` | 观察新的设备错误/状态；它仍依赖通信，不能替代独立硬件停止通道 |
+| 读轴状态/轴错误 | 接收 `Response::Heartbeat` | 用上面的缓存时效检查，不发送虚构的 Heartbeat RTR |
+| 读位置/速度 | `Query::EncoderEstimates` | `Response::EncoderEstimates { position, velocity }` |
+| 读电机/编码器错误 | `Query::MotorError` / `Query::EncoderError` | `Response::MotorError(bits)` / `Response::EncoderError(bits)` |
+| 读母线电压/电流 | `Query::VbusVoltage` / `Query::Iq` | `Response::VbusVoltage(volts)` / `Response::Iq { setpoint, measured }` |
+
+例如准备清错：
 
 ```rust
-use odrive_can_driver::socketcan::SocketCan;
-use socketcan::{SocketOptions, id::ERR_MASK_ALL};
+use odrive_can_driver::{Driver, OperationId, PrepareError, protocol::Command};
 
-let bus = SocketCan::open("can0")?;
-bus.socket().set_error_filter(ERR_MASK_ALL)?;
-bus.send(&mut driver, id, || monotonic_ms())?;
-let received = bus.receive(&mut driver, || monotonic_ms())?;
-record_socketcan_classification(received.classification);
-hand_back_to_bus_owner(Some(received.frame));
+fn prepare_clear_errors(driver: &mut Driver, now_ms: u64, deadline_ms: u64)
+    -> Result<OperationId, PrepareError>
+{
+    driver.prepare_command(Command::ClearErrors, now_ms, deadline_ms)
+}
 ```
 
-`SocketCan::open` 只打开并设为非阻塞模式；它不会创建接口、配置位速率或修改过滤器。SocketCAN 默认禁用错误通知；应用若需要保留错误帧，须通过 `bus.socket().set_error_filter(...)` 显式配置该描述符。`send` 遇到 `WouldBlock` 时明确未入队并回到 `Prepared`；其他 I/O 错误会保守地留下 `Unknown`，因为它们不能证明帧没有离开进程。
+取得 `id` 后，分别调用 `embedded_can::transmit_nb` / `transmit_blocking`、`embassy::transmit(...).await` 或 `SocketCan::send`。完整发送、接收、期限和错误分支见[三个后端示例](examples/README.md)。
 
-## 最小操作流程
+**写命令的 `Submitted` 只表示后端接受了帧。** 取走该报告后仍应持续接收；需要确认 Idle 或清错效果时，比较后续 Heartbeat 的 `received_at_ms` 与报告的 `submitted_at_ms`，并检查目标状态/错误位。CANSimple 没有事务序号，Heartbeat 不是命令 ACK，查询的 `Observed` 也只表示在时间窗口内观察到同节点同类型反馈。
 
-一个 `Driver` 绑定一个节点，并只保留一个活动或一个尚未取走的终态报告。应用以统一的单调毫秒时钟调用 `prepare_command` 或 `prepare_query`，取得 `OperationId` 后以 `begin_send` 取得 `SendAttempt`。应用把 `attempt.frame()` 交给自己拥有的发送路径，并依实际结果调用 `submitted`、`would_block` 或 `not_sent`；终态后先以 `take_report` 取走报告才可准备下一操作。查询反馈由应用在接收和分发时调用 `ingest`；周期性调用 `tick` 处理期限。
+清错不会自动进入闭环；进入闭环不会自动设置安全目标；写零速度也不等于进入 Idle。这些步骤由应用根据设备模式、限值和保护策略显式安排。
 
-```rust,no_run
-use odrive_can_driver::{Driver, OperationState};
-use odrive_can_driver::protocol::{NodeId, Query};
+## 异常处理
 
-let mut driver = Driver::new(NodeId::new(7).unwrap());
-let id = driver.prepare_query(Query::MotorError, 0, 100).unwrap();
-let attempt = driver.begin_send(id, 1).unwrap();
+处理顺序是：**保留原始错误 → 查看 `report(id)` → 依据发送进展处理 → 满足条件后取走报告**。不要仅凭一个 I/O 错误判断“设备没收到”。
 
-// 将 attempt.frame() 交给当前后端；确认其已接收该帧后才提交。
-let _encoded = attempt.frame();
-attempt.submitted(1).unwrap();
+| 情况 | 含义与处理 |
+|---|---|
+| `PrepareError::Encode`、`DeadlineElapsed`、`ClockRollback` | 准备失败，没有此次发送。修正参数、绝对期限或时钟来源；不要跳过验证 |
+| `PrepareError::Busy` | 上一操作或尚未取走的报告占用槽位。先处理它，不重建 Driver 来绕过未知状态 |
+| TX `WouldBlock` | 明确未被后端接受，通常仍为 `Prepared`；继续接收和检查期限，稍后重试**同一 id** |
+| RX 无帧 | embedded-can 返回 `Empty`，SocketCAN 返回 `WouldBlock`；不是设备故障，继续调度并 `tick` |
+| `Failed` / `Cancelled` | 此操作已知未提交；取走报告后由应用决定是否发起新操作。`cancel` 仅适用于 `Prepared` |
+| `TimedOut` | 看 `submitted_at_ms`：`None` 表示已知未提交，`Some` 表示查询已提交但反馈未及时观察到。取走报告，不据此认定设备未执行 |
+| 发送 I/O 错误、发送 future 中途丢弃、接受后无法记录提交 | 可能是 `Unknown`。保留错误和报告，不自动重试；`take_report` 此时返回 `UnknownPending` |
+| `Unknown` 的后续操作 | 先由应用确认底层不会再提交/迟到发送该帧，才调用 `acknowledge_unknown(id)`，随后 `take_report(id)`。这只释放追踪槽位，不证明设备未执行或已取消 |
+| 接收错误、FD/RTR/扩展帧或无法解码的帧 | 处理后端错误与分类，并将原始帧交还总线分发方；接收失败不回滚已经提交的命令，也不自动清错或复位外设 |
+| Heartbeat 过期、设备错误位非零 | 通信新鲜度与设备健康分开判断；保存完整错误位，再由应用决定停止、诊断、清错或恢复 |
 
-// 在统一 RX 分发处调用 driver.ingest(frame, rx_ms)，并定期推进期限。
-driver.tick(100).unwrap();
-assert_eq!(driver.take_report(id).unwrap().state, OperationState::TimedOut);
-```
+blocking 接口没有可由本库保证的超时中断；嵌入式异步接口须由应用安排 timer/取消点。`tick` 只推进驱动记录，不会终止阻塞调用、撤销控制器队列或停止电机。SocketCAN 默认关闭错误通知，若需要总线错误帧，须通过 `bus.socket().set_error_filter(...)` 显式启用，见示例。
 
-该片段刻意只展示所有后端共有的操作边界；可编译的收发接入见各示例。不得以 Heartbeat、同类周期帧或其他主机的查询回复证明写命令完成。
+## 共享总线与支持范围
 
-仓库中的 [`shared_bus`](examples/shared_bus.rs) 以默认 feature 演示“调用方发送并回报已知结果”的最小边界：
+调用方统一读取、分发和提交发送。后端返回无关帧与可能被置换的 TX 帧；共享总线应用须继续处理它们。`embedded-can` trait 只表达 Classic/RTR，FD 和底层错误信息应在原生 HAL 层分发；Embassy 与 SocketCAN 保留原生帧形态。库不清空 RX、不重配总线，也不重建共享外设。
 
-```sh
-cargo run --example shared_bus
-```
+协议支持仅限 `odrive-can-protocol 0.1.2` 核对的 **ODrive `fw-v0.5.1`** 和 **MKS ODrive Mini `ODriveMINI-fw-v0.5.1-20250326`**。固定源码依据见[协议库支持矩阵](https://github.com/MRNIU/odrive-can-protocol#readme)，不能据此推断其他固件兼容。
 
-## 操作结果与副作用
-
-`OperationReport` 保留操作 ID、种类、期限、准备、发送中、本地提交和终态时间戳。设备 CANSimple 没有事务序号，因此报告将“已经发送”和“设备已经执行”严格分开。
-
-| 情况或状态 | 含义 | 应用应做什么 |
-|---|---|---|
-| 未调用 | 没有准备操作、没有操作 ID，也没有发送副作用。 | 仅在产品许可成立时开始新的操作。 |
-| 本地参数或时间错误 | `prepare_*` 在分配 ID 前拒绝请求，未形成帧。 | 修正调用参数；这不是设备错误，也没有可重试的设备副作用。 |
-| `Prepared` / `Dispatching` | 已创建操作；`Dispatching` 表示发送已开始，尚不能证明底层未接收。 | 继续处理同一个 `SendAttempt`；不要并发启动另一操作。 |
-| `Submitted` | 本地 I/O 确认接收了帧。写命令在此终态；查询仍等待反馈。 | 把它视为本地提交，不要声称设备已执行。 |
-| `Observed` | 查询在提交后、期限前观察到同节点同类反馈。 | 把它视为观察到的协议反馈，不把它提升为带事务身份的设备 ACK。 |
-| `Failed` | 后端或调用方以 `not_sent` 明确结束本次发送，已知帧未被本地提交。 | 读取报告并按产品策略处理；它不同于无法判定是否发送的 `Unknown`。 |
-| `TimedOut` | 到达期限仍未完成；报告保留此前的发送进展。 | 按产品策略决定后续动作；不要自动重发副作用未知的命令。 |
-| `Cancelled` | 仅在 `Prepared` 时由 `cancel` 取消，尚未进入发送。 | 可安全放弃该准备操作。 |
-| `Unknown` | `SendAttempt` 在发送中被丢弃，或后端无法证明帧没有被接收。 | 先确认底层不再可能迟到发送，再 `acknowledge_unknown` 取走报告；不得自动重试。 |
-
-`would_block` 只适用于后端明确尚未接收帧的情况，并将操作回到可继续发送的准备状态；`not_sent` 只用于已知未提交的帧，并记录终态 `Failed`。若这两个回调的 `now_ms` 回退，调用会返回时钟诊断：`would_block` 保持 `Prepared`，`not_sent` 以最后已知单调时刻记录 `Failed`，都不把已知未发送误报为 `Unknown`。取消 future、普通 I/O 错误或调用栈退出均不能单独证明帧未发送，必须保守报告 `Unknown`。
-
-## 共享总线、watchdog 与控制边界
-
-调用方拥有共享 CAN 总线的读取、分发和发送所有权。驱动不会清空 RX、重配或重建外设，也不会吞掉其他节点的帧；后端保留实际接收帧与可能被替换的待发送帧，供调用方统一分发和处置。
-
-ODrive `fw-v0.5.1` 在有效节点的每一寻址 CANSimple 帧上喂 watchdog，包含 RTR。因而任意命令或查询都可能延长设备的 CAN watchdog；驱动绝不为此隐式发 query、Heartbeat 或保活帧。它同样不会自动重试、清除错误、请求闭环、恢复目标或判定运动完成。这些都是产品层必须显式作出的决定。
-
-## 协议支持
-
-本 crate 仅支持 `odrive-can-protocol 0.1.2` 已登记的 CANSimple 布局。它不因后端增加额外 ODrive 固件版本。
-
-| 固件 | 协议模块 | 状态 |
-|---|---|---|
-| ODrive `fw-v0.5.1` | `odrive_can_driver::protocol::fw_v0_5_1` | 支持 |
-| MKS ODrive Mini `ODriveMINI-fw-v0.5.1-20250326` | `odrive_can_driver::protocol::fw_v0_5_1` | 支持；与上述固定官方基线使用同一 CANSimple 布局。 |
-
-MKS 结论仅适用于[协议库 README 指定的固定源码包](https://github.com/makerbase-motor/MKS-ODrive/blob/e15782976ae93d42b1f0648ceec96503141a343b/Firmware/MKS%20ODrive%20MINI/ODriveMINI-fw-v0.5.1-20250326.rar)及其核对的[官方 ODrive 固定 revision `7831d795`](https://github.com/odriverobotics/ODrive/tree/7831d795235e5ef8535e4b46621a0721b458ec8f)。完整协议依据见 [odrive-can-protocol README](https://github.com/MRNIU/odrive-can-protocol/blob/main/README.md)。其他 MKS 固件版本必须先核对源码，不能据此推断兼容性。
-
-## 验证边界
-
-CI 覆盖受控的软件构建、单元测试、文档、lint、嵌入式交叉编译和显式运行的 Linux vcan 集成测试。软件注入和 vcan 只证明相应软件路径，不能证明物理 Bus-Off、接线、电源、设备身份、ODrive 配置或机械动作。真实设备验证需要在连接设备的主机上按示例的门禁执行并单独记录证据。
-
-## 贡献与许可
-
-贡献要求、验证矩阵和发布步骤见 [CONTRIBUTING.md](CONTRIBUTING.md)。本项目采用 [MIT License](LICENSE)，并保留适用版权信息。
+完整 API 合同见 [rustdoc](https://docs.rs/odrive_can_driver)，接入代码和时序见 [examples](examples/README.md)，已完成验证及限制见[验证记录](docs/validation.md)，贡献与发布流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。本项目采用 [MIT License](LICENSE)。
