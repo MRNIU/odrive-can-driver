@@ -1,5 +1,5 @@
 # Copyright The odrive-can-driver Contributors
-# 验证发布 crate 的共享核心和三个可选后端。
+# 使用 Rust stable 验证协议、共享核心和三个可选后端。
 
 name: CI
 
@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   core:
-    name: 默认核心
+    name: 协议与默认核心
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,11 +29,11 @@ jobs:
       - run: cargo build --locked --lib --target thumbv6m-none-eabi
 
   embedded_can:
-    name: embedded-can 与 MSRV
+    name: embedded-can
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
           targets: thumbv7em-none-eabihf
@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - run: cargo test --locked --all-targets --features socketcan
@@ -70,12 +70,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
           targets: thumbv7em-none-eabihf
       - run: >-
-          cargo test --locked --test embassy
+          cargo test --locked --test embassy --test protocol_compat
           --features embassy-stm32,embassy-stm32/stm32h723vg
       - run: >-
           cargo check --locked --example embassy_stm32 --target thumbv7em-none-eabihf

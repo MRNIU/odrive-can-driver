@@ -515,25 +515,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "odrive-can-protocol"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbdb060adf86b24eccd7a983622dca41b9d0ec40f708a81b745208ef92596647"
-dependencies = [
- "embassy-stm32",
- "embedded-can",
- "socketcan",
-]
-
-[[package]]
 name = "odrive_can_driver"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bxcan",
  "embassy-stm32",
  "embedded-can",
  "nb 1.1.0",
- "odrive-can-protocol",
  "socketcan",
 ]
 

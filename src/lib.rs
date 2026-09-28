@@ -38,4 +38,4 @@ pub use driver::{
     SendAttempt,
 };
 /// ODrive CANSimple 编解码器及硬件无关帧类型。
-pub use odrive_can_protocol as protocol;
+pub mod protocol;

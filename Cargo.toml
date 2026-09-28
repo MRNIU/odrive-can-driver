@@ -1,12 +1,12 @@
 # Copyright The odrive-can-driver Contributors
-# 定义单库发布元数据、共享协议依赖及三个可选收发后端。
+# 定义协议与驱动的单库发布元数据及三个可选收发后端。
 
 [package]
 name = "odrive_can_driver"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
-description = "Allocation-free ODrive CANSimple driver with shared operation tracking and optional CAN backends"
+rust-version = "1.98.1"
+description = "Allocation-free ODrive CANSimple codec and driver with optional CAN backends"
 repository = "https://github.com/MRNIU/odrive-can-driver"
 homepage = "https://github.com/MRNIU/odrive-can-driver"
 documentation = "https://docs.rs/odrive_can_driver"
@@ -18,12 +18,11 @@ include = ["src/**", "tests/**", "examples/**", "README.md", "CONTRIBUTING.md", 
 
 [features]
 default = []
-embedded-can = ["dep:embedded-can", "dep:nb", "odrive-can-protocol/embedded-can"]
-embassy-stm32 = ["dep:embassy-stm32", "odrive-can-protocol/embassy-stm32"]
-socketcan = ["dep:socketcan", "odrive-can-protocol/socketcan"]
+embedded-can = ["dep:embedded-can", "dep:nb"]
+embassy-stm32 = ["embedded-can", "dep:embassy-stm32"]
+socketcan = ["embedded-can", "dep:socketcan"]
 
 [dependencies]
-odrive-can-protocol = "=0.1.2"
 embedded-can = { version = "0.4.1", optional = true }
 nb = { version = "1.1", optional = true }
 embassy-stm32 = { version = "0.6.0", default-features = false, optional = true }

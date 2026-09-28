@@ -1,4 +1,5 @@
 <!-- Copyright The odrive-can-driver Contributors -->
+<!-- Copyright The odrive-can-protocol Contributors -->
 <!-- 说明安装、三个后端的用法与时序，以及操作结果和异常处理。 -->
 
 # odrive-can-driver
@@ -7,26 +8,80 @@
 [![crates.io](https://img.shields.io/crates/v/odrive_can_driver.svg)](https://crates.io/crates/odrive_can_driver)
 [![docs.rs](https://docs.rs/odrive_can_driver/badge.svg)](https://docs.rs/odrive_can_driver)
 [![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0/)
+[![Rust](https://img.shields.io/badge/Rust-1.98.1-blue.svg)](https://www.rust-lang.org/tools/install)
 
-`odrive_can_driver` 是 ODrive CANSimple 驱动库。共享 `Driver` 管理单节点的命令、查询、反馈缓存、操作身份、期限和发送结果；三个可选后端负责实际收发。默认 `no_std`、无动态分配，使用已发布的 `odrive-can-protocol 0.1.2` 编解码与帧适配。
+`odrive_can_driver` 是 ODrive CANSimple 库。它在同一个 crate 中提供硬件无关的 `protocol` 编解码层，以及管理单节点命令、查询、反馈缓存、操作身份、期限和发送结果的 `Driver`。三个可选后端负责实际收发。默认构建保持 `no_std`、无动态分配、无正常第三方依赖。
+
+本版本要求 Rust 1.98.1（发布时的最新稳定版）。可选后端还需要各自的平台与外设条件，见下表。
 
 ## 安装
 
 ```toml
 [dependencies]
-odrive_can_driver = { version = "0.1.1", features = ["embedded-can"] }
+odrive_can_driver = { version = "0.2.0", features = ["embedded-can"] }
 ```
 
-按接入方式选择 feature；只使用共享状态机时可省略 `features`，默认是 `[]`。
+按接入方式选择 feature；只使用协议编解码或共享状态机时可省略 `features`，默认是 `[]`。
 
-| feature | 接入方式 | Rust 要求 | 使用入口 |
+| feature | 接入方式 | 平台与配置 | 使用入口 |
 |---|---|---|---|
-| `embedded-can` | 实现 `embedded-can 0.4` 的 HAL，blocking 或非阻塞轮询 | 1.85 | [轮询示例与时序](#embedded-can) |
-| `embassy-stm32` | 已配置的 STM32 FDCAN，原生异步收发 | 固定依赖组合已验证 1.98.1 | [依赖配置、异步示例与时序](#embassy-stm32) |
-| `socketcan` | Linux 非阻塞 SocketCAN，无异步运行时 | 1.89 | [命令行示例与时序](#socketcan) |
+| `embedded-can` | 实现 `embedded-can 0.4` 的 HAL，blocking 或非阻塞轮询 | 任何支持本 crate 的目标 | [轮询示例与时序](#embedded-can) |
+| `embassy-stm32` | 已配置的 STM32 FDCAN，原生异步收发 | 应用选择 STM32、引脚、时钟和位速率 | [依赖配置、异步示例与时序](#embassy-stm32) |
+| `socketcan` | Linux 非阻塞 SocketCAN，无异步运行时 | Linux 与 SocketCAN 接口 | [命令行示例与时序](#socketcan) |
 
 **Embassy 必须使用下文的 workspace patch**：registry `embassy-stm32 0.6.0` 存在 RTR DLC 8 发送缺陷；已验证的 Git revision 修复了它。Cargo 不会向消费方传递本库的 patch。
+
+## 只使用协议编解码
+
+协议层在 `odrive_can_driver::protocol` 下，不访问 CAN 外设、不维护操作期限，也不决定控制策略。它可独立用于需要自己管理收发的应用：
+
+```rust
+use odrive_can_driver::protocol::{
+    decode, encode, AxisState, Command, FrameId, FramePayload, FrameRef, Message, NodeId,
+    Query, Response,
+};
+
+let node = NodeId::new(1).unwrap();
+let velocity = encode(
+    node,
+    Message::Command(Command::SetInputVel {
+        velocity: -2.5,
+        torque_ff: 0.25,
+    }),
+)
+.unwrap();
+assert_eq!(velocity.id(), 0x02d);
+
+let request = encode(node, Message::Request(Query::EncoderEstimates)).unwrap();
+assert!(request.is_remote());
+assert_eq!(request.dlc(), 8);
+
+let heartbeat = [0x01, 0x00, 0x00, 0x80, 0x08, 0x00, 0x01, 0x00];
+let frame = FrameRef {
+    id: FrameId::Standard(0x021),
+    payload: FramePayload::Data(&heartbeat),
+};
+assert_eq!(
+    decode(node, frame).unwrap(),
+    Some(Message::Response(Response::Heartbeat {
+        axis_error: 0x8000_0001,
+        axis_state: AxisState(0x0001_0008),
+    }))
+);
+```
+
+此示例只产生或解析协议帧；要发送 `velocity` 或 `request`，请使用下文的后端，或由应用自身提交帧。
+
+## 从 `odrive-can-protocol` 迁移
+
+`odrive-can-protocol` 的 `0.1.x` 是旧的独立 crate；其实现已内置到本 crate。将 Cargo 依赖改为 `odrive_can_driver = "0.2.0"`，并把导入从 `odrive_can_protocol::...` 改为 `odrive_can_driver::protocol::...`。例如：
+
+```rust
+// 旧：use odrive_can_protocol::{encode, Command, NodeId};
+use odrive_can_driver::protocol::{encode, Command, NodeId};
+```
+
+旧独立 crate 的类型与本 crate 的内置类型不是同一 Rust 类型，即使名称和字段相同；同一个调用边界只能使用其中一套类型。迁移后删除旧依赖，不要同时混用两者。
 
 ## 一次操作怎样完成
 
@@ -136,7 +191,7 @@ blocking 接口没有可由本库保证的超时中断；嵌入式异步接口�
 
 ```toml
 [dependencies]
-odrive_can_driver = { version = "0.1.1", features = ["embedded-can"] }
+odrive_can_driver = { version = "0.2.0", features = ["embedded-can"] }
 embedded-can = "0.4.1"
 ```
 
@@ -193,14 +248,14 @@ HAL 只有 blocking 接口时，改用 `transmit_blocking`、`receive_blocking`�
 
 ```toml
 [dependencies]
-odrive_can_driver = { version = "0.1.1", features = ["embassy-stm32"] }
+odrive_can_driver = { version = "0.2.0", features = ["embassy-stm32"] }
 embassy-stm32 = { version = "0.6.0", features = ["stm32h723vg"] }
 
 [patch.crates-io]
 embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", rev = "7b08a9c7d9a9fe620f4be25c4e7b86dd29f09f54" }
 ```
 
-registry `embassy-stm32 0.6.0` 只在 DLC 为 0 时设置发送 RTR 位，而本协议查询使用 DLC 8；上述修订修复了它。Cargo 不向下游传递 library 的 patch，所以只启用 feature 不足以采用修复。该依赖组合使用 Rust 1.98.1；默认核心的 1.85 MSRV 不适用于这个可选后端。`stm32h723vg` 是芯片 feature 示例，应用应选择自己的 FDCAN 芯片。
+registry `embassy-stm32 0.6.0` 只在 DLC 为 0 时设置发送 RTR 位，而本协议查询使用 DLC 8；上述修订修复了它。Cargo 不向下游传递 library 的 patch，所以只启用 feature 不足以采用修复。该依赖组合使用 Rust 1.98.1。`stm32h723vg` 是芯片 feature 示例，应用应选择自己的 FDCAN 芯片。
 
 应用初始化芯片、FDCAN 引脚、时钟与位速率，并拥有 executor。示例 `exchange_until` 对已有的 `Can` 和 `Driver` 推进一次操作：
 
@@ -255,7 +310,7 @@ sequenceDiagram
 
 ```toml
 [dependencies]
-odrive_can_driver = { version = "0.1.1", features = ["socketcan"] }
+odrive_can_driver = { version = "0.2.0", features = ["socketcan"] }
 # 应用需要配置 socket 错误过滤器时直接使用此依赖。
 socketcan = { version = "4", default-features = false }
 ```
@@ -317,10 +372,19 @@ sequenceDiagram
 
 `receive` 返回 `WouldBlock` 时等待下一轮，不能把它当作设备错误；`send` 返回 `WouldBlock` 才允许重试同一操作。其他发送错误可能已产生副作用，按报告处理。出队观察时间不是硬件线上采样时间，不能用它证明队列中的帧刚刚由设备产生。
 
-## 共享总线与支持范围
+## 共享总线
 
 调用方统一读取、分发和提交发送。后端返回无关帧与可能被置换的 TX 帧；共享总线应用须继续处理它们。`embedded-can` trait 只表达 Classic/RTR，FD 和底层错误信息应在原生 HAL 层分发；Embassy 与 SocketCAN 保留原生帧形态。库不清空 RX、不重配总线，也不重建共享外设。
 
-协议支持仅限 `odrive-can-protocol 0.1.2` 核对的 **ODrive `fw-v0.5.1`** 和 **MKS ODrive Mini `ODriveMINI-fw-v0.5.1-20250326`**。固定源码依据见[协议库支持矩阵](https://github.com/MRNIU/odrive-can-protocol#readme)，不能据此推断其他固件兼容。
+## 协议支持范围
+
+协议 API 位于 `odrive_can_driver::protocol::fw_v0_5_1`，crate 的 `protocol` 模块同时重导出主要类型与 `encode`、`decode`。编码只产生 11-bit Classic CAN 帧；多字节字段为 little-endian，浮点字段为 IEEE 754 binary32。
+
+| 固件 | 协议模块 | 状态 | 固定源码依据 |
+|---|---|---|---|
+| ODrive `fw-v0.5.1` | `fw_v0_5_1` | 已支持 | [ODrive 固件基线 `7831d795`](https://github.com/odriverobotics/ODrive/tree/7831d795235e5ef8535e4b46621a0721b458ec8f) |
+| MKS ODrive Mini `ODriveMINI-fw-v0.5.1-20250326` | `fw_v0_5_1` | 已支持，同一 CANSimple 布局 | [固定 MKS 固件包](https://github.com/makerbase-motor/MKS-ODrive/blob/e15782976ae93d42b1f0648ceec96503141a343b/Firmware/MKS%20ODrive%20MINI/ODriveMINI-fw-v0.5.1-20250326.rar) |
+
+MKS 结论仅覆盖表中的固定源码包：其中 CANSimple 源码与上述 ODrive 基线一致，因此不需要 MKS 专用 feature 或转换层。其他 ODrive 或 MKS 固件版本必须先核对对应源码，不能由本表推断兼容性。
 
 完整 API 合同见 [rustdoc](https://docs.rs/odrive_can_driver)，贡献说明见 [CONTRIBUTING.md](CONTRIBUTING.md)。本项目采用 [MIT License](LICENSE)。

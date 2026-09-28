@@ -4,8 +4,8 @@
 //! 此模块只接受 Classic 数据帧或 RTR。`embedded_can::Frame` 不表达 FDF 或总线错误位；需要
 //! 保留这些信息的应用应在原生控制器层完成分发。调用方仍拥有共享总线的 RX/TX 调度权。
 
+use crate::protocol::compat::embedded_can::InvalidFrameLength;
 use embedded_can::{Frame, blocking, nb};
-use odrive_can_protocol::compat::embedded_can::InvalidFrameLength;
 
 use crate::{AttemptError, BeginSendError, Driver, IngestResult, OperationId};
 
@@ -183,7 +183,7 @@ pub fn ingest_classic_frame<F>(
 where
     F: Frame,
 {
-    let view = match odrive_can_protocol::FrameRef::from_classic_embedded_can(&frame) {
+    let view = match crate::protocol::FrameRef::from_classic_embedded_can(&frame) {
         Ok(view) => view,
         Err(error) => return Err((frame, error)),
     };

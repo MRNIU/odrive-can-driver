@@ -9,12 +9,12 @@
 //! crates.io 的 `embassy-stm32 0.6.0` 仅在 DLC 为 0 时设置 FDCAN RTR 位，而 CANSimple
 //! 查询使用 DLC 8；该修订正确保留 RTR 位。Cargo 不向消费方传递 library 的 patch。
 
+use crate::protocol::compat::embassy::FromEmbassyError;
 use embassy_stm32::can::{
     Can,
     enums::BusError,
     frame::{FdEnvelope, FdFrame, Frame},
 };
-use odrive_can_protocol::compat::embassy::FromEmbassyError;
 
 use crate::{AttemptError, BeginSendError, Driver, IngestResult, OperationId};
 
@@ -103,7 +103,7 @@ pub async fn receive_with_timestamp(
 /// 所有成功构造协议视图的帧都会连同原生容器返回；分类可能是 `Message`、`Unrelated` 或
 /// `DecodeError`。因此协议解码在节点过滤前拒绝扩展 ID 或 FD 时，帧也不会被吞掉。
 pub fn ingest_fd_frame(driver: &mut Driver, frame: FdFrame, received_at_ms: u64) -> EmbassyReceive {
-    match odrive_can_protocol::FrameRef::try_from(&frame) {
+    match crate::protocol::FrameRef::try_from(&frame) {
         Ok(view) => EmbassyReceive::Frame {
             classification: driver.ingest(view, received_at_ms),
             frame,
