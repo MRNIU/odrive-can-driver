@@ -256,7 +256,8 @@ fn vcan_peer_preserves_raw_rx_timestamp_and_local_submission() {
             Err(error) => panic!("vcan peer read failed: {error}"),
         })
         .expect("vcan peer did not observe local submission");
-    let encoded = protocol::encode(node(), protocol::Message::Command(Command::ClearErrors)).unwrap();
+    let encoded =
+        protocol::encode(node(), protocol::Message::Command(Command::ClearErrors)).unwrap();
     let expected: socketcan::CanFrame = (&encoded).into();
     assert_eq!(sent, CanAnyFrame::from(expected));
 }
