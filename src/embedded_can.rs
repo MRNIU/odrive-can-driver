@@ -1,184 +1,337 @@
 // Copyright The odrive-can-driver Contributors
-//! `embedded-can` 0.4 Classic CAN 的同步与非阻塞适配。
+//! `embedded-can` 0.4 non-blocking endpoint adapter.
 //!
-//! 此模块只接受 Classic 数据帧或 RTR。`embedded_can::Frame` 不表达 FDF 或总线错误位；需要
-//! 保留这些信息的应用应在原生控制器层完成分发。调用方仍拥有共享总线的 RX/TX 调度权。
+//! [`CanTx`] and [`CanRx`] deliberately have separate ownership. The blanket
+//! implementations let one `embedded_can::nb::Can` implement both, while a
+//! shared-bus application can pass separate endpoint handles. This module
+//! never drains RX or configures either endpoint.
+//!
+//! `embedded-can` Classic frames cannot represent CAN FD frames or bus-error
+//! notifications. Applications which need those retain and distribute them
+//! at their controller-specific boundary. A receive timestamp is the
+//! application's observation timestamp in the driver's [`Instant`] clock
+//! domain; it is not asserted to be a hardware edge timestamp.
 
 use crate::protocol::compat::embedded_can::InvalidFrameLength;
-use embedded_can::{Frame, blocking, nb};
+use crate::{
+    AttemptError, BeginSendError, Driver, IngestResult, Instant, SendPermit, TxAttempt,
+    TxCompletion, TxOutcome,
+};
+use embedded_can::{Frame, nb};
 
-use crate::{AttemptError, BeginSendError, Driver, IngestResult, OperationId};
+/// A non-blocking TX endpoint owned by the application.
+pub trait CanTx {
+    /// Native Classic CAN frame type.
+    type Frame: Frame;
+    /// Native controller error type.
+    type Error;
 
-/// 非阻塞发送完成时的可观察结果。
-#[derive(Debug, PartialEq, Eq)]
-pub enum NbTransmit<F> {
-    /// 新帧已被本地队列接受。
+    /// Attempts to queue one frame.
+    ///
+    /// `WouldBlock` has the exact `embedded-can` 0.4 meaning: no TX buffer
+    /// accepted this frame and no lower-priority pending frame was replaced.
+    /// Returning `Ok(Some(frame))` means the new frame was accepted and the
+    /// returned native frame was displaced.
+    fn try_transmit(
+        &mut self,
+        frame: &Self::Frame,
+    ) -> Result<Option<Self::Frame>, ::nb::Error<Self::Error>>;
+}
+
+/// A non-blocking RX endpoint owned by the application.
+pub trait CanRx {
+    /// Native Classic CAN frame type.
+    type Frame: Frame;
+    /// Native controller error type.
+    type Error;
+
+    /// Attempts to dequeue one frame without draining the endpoint.
+    fn try_receive(&mut self) -> Result<Self::Frame, ::nb::Error<Self::Error>>;
+}
+
+impl<C> CanTx for C
+where
+    C: nb::Can,
+{
+    type Frame = C::Frame;
+    type Error = C::Error;
+
+    fn try_transmit(
+        &mut self,
+        frame: &Self::Frame,
+    ) -> Result<Option<Self::Frame>, ::nb::Error<Self::Error>> {
+        self.transmit(frame)
+    }
+}
+
+impl<C> CanRx for C
+where
+    C: nb::Can,
+{
+    type Frame = C::Frame;
+    type Error = C::Error;
+
+    fn try_receive(&mut self) -> Result<Self::Frame, ::nb::Error<Self::Error>> {
+        self.receive()
+    }
+}
+
+/// A single native TX attempt whose driver borrow exists only during [`Self::poll`].
+#[must_use]
+pub struct NbTx<'s> {
+    attempt: TxAttempt<'s>,
+}
+
+impl core::fmt::Debug for NbTx<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.debug_struct("NbTx").finish_non_exhaustive()
+    }
+}
+
+impl<'s> NbTx<'s> {
+    /// Consumes a prepared permit to begin one native non-blocking TX attempt.
+    pub fn begin(
+        driver: &mut Driver<'s>,
+        permit: SendPermit<'s>,
+        at: Instant,
+    ) -> Result<Self, BeginSendError> {
+        driver
+            .begin_send(permit, at)
+            .map(|attempt| Self { attempt })
+    }
+
+    /// Cancels before this adapter has called the native endpoint.
+    ///
+    /// Consuming `self` proves this adapter will not later poll this attempt.
+    /// The application must only use it before [`Self::poll`]; it is not proof
+    /// about a controller call made outside this object.
+    pub fn cancel_unsubmitted(
+        self,
+        driver: &mut Driver<'s>,
+        occurred_at: Instant,
+        processed_at: Instant,
+    ) -> Result<(), AttemptError> {
+        driver.cancel_unsubmitted(self.attempt, occurred_at, processed_at)
+    }
+
+    /// Polls the native endpoint exactly once and consumes this attempt.
+    ///
+    /// The driver is borrowed only to authorize this one poll and to record its
+    /// completed result. `now` is sampled immediately before native I/O, once
+    /// immediately after it ends as the result event time, and again when the
+    /// result is recorded. Thus the application may receive frames, advance a
+    /// deadline, or cancel a retry permit between calls. If this function
+    /// returns a controller error, the native call has ended but whether it
+    /// queued the frame is not proved; the driver is changed to `Unknown`.
+    pub fn poll<T>(
+        self,
+        driver: &mut Driver<'s>,
+        tx: &mut T,
+        mut now: impl FnMut() -> Instant,
+    ) -> Result<NbTransmit<'s, T::Frame>, NbTransmitError<'s, T::Error>>
+    where
+        T: CanTx,
+    {
+        let frame = match driver.authorize_tx(&self.attempt, now()) {
+            Ok(frame) => frame,
+            Err(error) => {
+                return Err(NbTransmitError::Authorize {
+                    attempt: self,
+                    error,
+                });
+            }
+        };
+        let Some(native) = frame.to_embedded_can::<T::Frame>() else {
+            let occurred_at = now();
+            let processed_at = now();
+            return match finish_not_submitted(driver, self.attempt, occurred_at, processed_at) {
+                Ok(_) => Err(NbTransmitError::FrameRejected),
+                Err(error) => Err(NbTransmitError::Finish(error)),
+            };
+        };
+
+        match tx.try_transmit(&native) {
+            Ok(displaced) => {
+                let occurred_at = now();
+                let processed_at = now();
+                match driver.finish_tx(
+                    self.attempt,
+                    TxOutcome::Submitted { occurred_at },
+                    processed_at,
+                ) {
+                    Ok(TxCompletion::Submitted) => Ok(NbTransmit::Submitted { displaced }),
+                    Ok(completion) => Ok(NbTransmit::Finished {
+                        displaced,
+                        completion,
+                    }),
+                    Err(error) => Ok(NbTransmit::Uncertain { displaced, error }),
+                }
+            }
+            Err(::nb::Error::WouldBlock) => {
+                let occurred_at = now();
+                let processed_at = now();
+                match driver.finish_tx(
+                    self.attempt,
+                    TxOutcome::WouldBlock { occurred_at },
+                    processed_at,
+                ) {
+                    Ok(TxCompletion::Retry(retry)) => Ok(NbTransmit::WouldBlock { retry }),
+                    Ok(completion) => Ok(NbTransmit::Finished {
+                        displaced: None,
+                        completion,
+                    }),
+                    Err(error) => Ok(NbTransmit::Uncertain {
+                        displaced: None,
+                        error,
+                    }),
+                }
+            }
+            Err(::nb::Error::Other(error)) => {
+                let _ = driver.abandon_attempt(self.attempt, now());
+                Err(NbTransmitError::Driver(error))
+            }
+        }
+    }
+}
+
+fn finish_not_submitted<'s>(
+    driver: &mut Driver<'s>,
+    attempt: TxAttempt<'s>,
+    occurred_at: Instant,
+    processed_at: Instant,
+) -> Result<TxCompletion<'s>, AttemptError> {
+    driver.finish_tx(
+        attempt,
+        TxOutcome::NotSubmitted { occurred_at },
+        processed_at,
+    )
+}
+
+/// Completed non-blocking TX observation.
+#[derive(Debug)]
+pub enum NbTransmit<'s, F> {
+    /// The controller accepted this frame. The displaced native frame stays
+    /// with the application and must not be dropped by a shared-bus loop.
     Submitted {
-        /// 被控制器替换的低优先级原生帧；调用方必须继续处理它。
+        /// A lower-priority pending native frame displaced by this submission.
         displaced: Option<F>,
     },
-    /// 控制器确认未接收新帧；操作保持 `Prepared`，调用方可稍后重试。
-    WouldBlock,
-    /// 原生帧已入队，但 core 无法记录为 `Submitted`；操作已是 `Unknown`。
+    /// The completed synchronous native call proved this frame was not queued.
     ///
-    /// 即使状态不确定，队列替换出的帧仍会原样返回。
+    /// The returned permit is the only valid way to start another attempt. The
+    /// application may instead call [`Driver::cancel`] with `retry.id()`.
+    WouldBlock {
+        /// One-use permit for a later attempt of the same operation.
+        retry: SendPermit<'s>,
+    },
+    /// A core time diagnostic after the native call. The operation report retains the actual
+    /// submission or proved non-submission; consult it instead of inferring either from this
+    /// variant. A displaced native frame is preserved even when recording submission failed.
     Uncertain {
-        /// 被替换的原生帧。
+        /// A displaced native frame, if the controller provided one.
         displaced: Option<F>,
-        /// core 拒绝记录提交的原因。
+        /// Core diagnostic for the late or inconsistent result processing.
         error: AttemptError,
+    },
+    /// Core reached a terminal completion while the native result was being
+    /// processed. This preserves any displaced frame and never invents retry.
+    Finished {
+        /// A displaced native frame, if the controller provided one.
+        displaced: Option<F>,
+        /// The core's terminal completion.
+        completion: TxCompletion<'s>,
     },
 }
 
-/// 非阻塞发送无法产生 [`NbTransmit`] 的原因。
+/// TX error which still preserves the real native outcome boundary.
 #[derive(Debug)]
-pub enum NbTransmitError<E> {
-    /// core 拒绝开始本次发送。
-    Begin(BeginSendError),
-    /// 原生 Classic 帧构造器拒绝了已编码帧；操作已确定为 `Failed`。
+pub enum NbTransmitError<'s, E> {
+    /// The driver rejected authorization before this native call began. The
+    /// returned attempt can be cancelled with proved no native submission.
+    Authorize {
+        /// Unpolled attempt that remains the sole authority to close it.
+        attempt: NbTx<'s>,
+        /// Core authorization diagnostic.
+        error: AttemptError,
+    },
+    /// The encoded Classic frame could not be represented by this native type;
+    /// no endpoint call occurred and the operation is `Failed`.
     FrameRejected,
-    /// 明确未发送或本地提交记录的时钟检查失败。
-    Attempt(AttemptError),
-    /// 控制器报告的非 `WouldBlock` 错误。
-    ///
-    /// `SendAttempt` 会析构成 `Unknown`，因为该错误不能证明帧未入队。
+    /// Core could not record a proved pre-I/O rejection.
+    Finish(AttemptError),
+    /// A native controller error. It does not prove non-submission; the
+    /// operation is retained as `Unknown`.
     Driver(E),
 }
 
-/// 非阻塞接收的可观察结果。
+/// One non-blocking receive result, including its unmodified native frame.
 #[derive(Debug)]
 pub enum NbReceive<F> {
-    /// 当前没有可读帧。
+    /// No frame was available on this endpoint.
     Empty,
-    /// 原生帧及 core 对它的协议分类。
-    ///
-    /// 即使分类为 `DecodeError` 或 `Unrelated`，原生帧也保留给共享总线调用方。
+    /// One native Classic/RTR frame and this driver's protocol classification.
     Frame {
-        /// 原始 Classic CAN 或 RTR 帧。
+        /// Native frame for the application's shared-bus distribution.
         frame: F,
-        /// 此 driver 的协议分类。
+        /// Observation timestamp sampled after the endpoint returned this frame.
+        received_at: Instant,
+        /// This driver's classification only; it does not consume the frame.
         classification: IngestResult,
     },
 }
 
-/// 非阻塞接收无法产生 [`NbReceive`] 的原因。
+/// Receive failure retaining raw controller errors and invalid native frames.
 #[derive(Debug)]
 pub enum NbReceiveError<F, E> {
-    /// 原生驱动报告错误。
+    /// Native controller error.
     Driver(E),
-    /// 驱动帧不满足 Classic CAN 长度合同，原始帧没有被丢弃。
+    /// Invalid Classic length; the original frame was retained.
     InvalidFrame {
-        /// 原始驱动帧。
+        /// Original native frame.
         frame: F,
-        /// 长度拒绝原因。
+        /// Observation timestamp sampled after the endpoint returned this frame.
+        received_at: Instant,
+        /// Conversion error.
         error: InvalidFrameLength,
     },
 }
 
-/// `embedded-can::nb::Can` 接收一次的完整结果。
-pub type NbReceiveResult<C> = Result<
-    NbReceive<<C as nb::Can>::Frame>,
-    NbReceiveError<<C as nb::Can>::Frame, <C as nb::Can>::Error>,
+/// A complete non-blocking receive result for one endpoint's frame and error types.
+pub type NbReceiveResult<R> = Result<
+    NbReceive<<R as CanRx>::Frame>,
+    NbReceiveError<<R as CanRx>::Frame, <R as CanRx>::Error>,
 >;
 
-/// blocking 发送无法明确提交的原因。
-#[derive(Debug)]
-pub enum BlockingTransmitError<E> {
-    /// core 拒绝开始本次发送。
-    Begin(BeginSendError),
-    /// 原生 Classic 帧构造器拒绝了已编码帧；操作已确定为 `Failed`。
-    FrameRejected,
-    /// core 无法以调用方时钟记录发送结果。
-    Attempt(AttemptError),
-    /// blocking 驱动返回错误。
-    ///
-    /// 调用期间没有本模块可保证的 deadline 或取消点；guard 析构后操作为 `Unknown`。
-    Driver(E),
-}
-
-/// blocking 接收无法产生 [`NbReceive`] 的原因。
-#[derive(Debug)]
-pub enum BlockingReceiveError<F, E> {
-    /// 原生驱动报告错误。
-    Driver(E),
-    /// 驱动帧不满足 Classic CAN 长度合同，原始帧没有被丢弃。
-    InvalidFrame {
-        /// 原始驱动帧。
-        frame: F,
-        /// 长度拒绝原因。
-        error: InvalidFrameLength,
-    },
-}
-
-/// `embedded-can::blocking::Can` 接收一次的完整结果。
-pub type BlockingReceiveResult<C> = Result<
-    NbReceive<<C as blocking::Can>::Frame>,
-    BlockingReceiveError<<C as blocking::Can>::Frame, <C as blocking::Can>::Error>,
->;
-
-/// 尝试把一个已准备操作交给 `embedded-can::nb::Can`。
-///
-/// `Ok(Some(displaced))` 说明新帧已经进入队列，故本函数会先记录本操作 `Submitted`，再把
-/// `displaced` 返回给调用方；它绝不会把置换帧当作本操作未发送。明确 `WouldBlock` 才会让
-/// core 回到 `Prepared`。其他驱动错误和调用取消均保守地保留 `Unknown`。
-pub fn transmit_nb<C>(
-    driver: &mut Driver,
-    id: OperationId,
-    can: &mut C,
-    mut now_ms: impl FnMut() -> u64,
-) -> Result<NbTransmit<C::Frame>, NbTransmitError<C::Error>>
+/// Reads and classifies at most one native frame, sampling time after dequeue.
+pub fn receive_nb<R>(
+    driver: &mut Driver<'_>,
+    rx: &mut R,
+    observed_at: impl FnOnce() -> Instant,
+) -> NbReceiveResult<R>
 where
-    C: nb::Can,
-    C::Frame: Frame,
+    R: CanRx,
 {
-    let attempt = driver
-        .begin_send(id, now_ms())
-        .map_err(NbTransmitError::Begin)?;
-    let Some(frame) = attempt.frame().to_embedded_can::<C::Frame>() else {
-        attempt
-            .not_sent(now_ms())
-            .map_err(NbTransmitError::Attempt)?;
-        return Err(NbTransmitError::FrameRejected);
-    };
-    match can.transmit(&frame) {
-        Ok(displaced) => match attempt.submitted(now_ms()) {
-            Ok(()) => Ok(NbTransmit::Submitted { displaced }),
-            Err(error) => Ok(NbTransmit::Uncertain { displaced, error }),
-        },
-        Err(::nb::Error::WouldBlock) => attempt
-            .would_block(now_ms())
-            .map(|()| NbTransmit::WouldBlock)
-            .map_err(NbTransmitError::Attempt),
-        Err(::nb::Error::Other(error)) => Err(NbTransmitError::Driver(error)),
-    }
-}
-
-/// 从 `embedded-can::nb::Can` 读取一帧并交给 core 分类。
-///
-/// `timestamp_ms` 在成功取出该帧后记录调用方观察时刻；控制器 RX 队列可能已经包含更早到达
-/// 的帧，本函数不把此时刻宣称为物理线上采样时间，也不清空队列。
-pub fn receive_nb<C>(
-    driver: &mut Driver,
-    can: &mut C,
-    timestamp_ms: impl FnOnce() -> u64,
-) -> NbReceiveResult<C>
-where
-    C: nb::Can,
-    C::Frame: Frame,
-{
-    match can.receive() {
-        Ok(frame) => ingest_classic_frame(driver, frame, timestamp_ms())
-            .map_err(|(frame, error)| NbReceiveError::InvalidFrame { frame, error }),
+    match rx.try_receive() {
+        Ok(frame) => {
+            let received_at = observed_at();
+            ingest_classic_frame(driver, frame, received_at).map_err(|(frame, error)| {
+                NbReceiveError::InvalidFrame {
+                    frame,
+                    received_at,
+                    error,
+                }
+            })
+        }
         Err(::nb::Error::WouldBlock) => Ok(NbReceive::Empty),
         Err(::nb::Error::Other(error)) => Err(NbReceiveError::Driver(error)),
     }
 }
 
-/// 把一个已由调用方取得的 Classic CAN 帧交给 core 分类。
+/// Classifies a Classic/RTR frame already dequeued by the application.
 pub fn ingest_classic_frame<F>(
-    driver: &mut Driver,
+    driver: &mut Driver<'_>,
     frame: F,
-    received_at_ms: u64,
+    received_at: Instant,
 ) -> Result<NbReceive<F>, (F, InvalidFrameLength)>
 where
     F: Frame,
@@ -187,56 +340,10 @@ where
         Ok(view) => view,
         Err(error) => return Err((frame, error)),
     };
-    let classification = driver.ingest(view, received_at_ms);
+    let classification = driver.ingest(view, received_at);
     Ok(NbReceive::Frame {
         frame,
+        received_at,
         classification,
     })
-}
-
-/// 通过 `embedded-can::blocking::Can` 发送一个已准备操作。
-///
-/// 此适配没有标准 trait 提供的 deadline 或可撤销点。调用取消或 `Driver` 未能记录回调时，
-/// 操作会保守地变为 `Unknown`；应用若需要可轮询的时效和取消语义，应使用 [`transmit_nb`]。
-pub fn transmit_blocking<C>(
-    driver: &mut Driver,
-    id: OperationId,
-    can: &mut C,
-    mut now_ms: impl FnMut() -> u64,
-) -> Result<(), BlockingTransmitError<C::Error>>
-where
-    C: blocking::Can,
-    C::Frame: Frame,
-{
-    let attempt = driver
-        .begin_send(id, now_ms())
-        .map_err(BlockingTransmitError::Begin)?;
-    let Some(frame) = attempt.frame().to_embedded_can::<C::Frame>() else {
-        attempt
-            .not_sent(now_ms())
-            .map_err(BlockingTransmitError::Attempt)?;
-        return Err(BlockingTransmitError::FrameRejected);
-    };
-    can.transmit(&frame)
-        .map_err(BlockingTransmitError::Driver)?;
-    attempt
-        .submitted(now_ms())
-        .map_err(BlockingTransmitError::Attempt)
-}
-
-/// 从 `embedded-can::blocking::Can` 读取一帧并交给 core 分类。
-///
-/// 成功返回时 `timestamp_ms` 给出调用方观察到出队帧的时刻；该帧可能已在硬件队列中等待。
-pub fn receive_blocking<C>(
-    driver: &mut Driver,
-    can: &mut C,
-    timestamp_ms: impl FnOnce() -> u64,
-) -> BlockingReceiveResult<C>
-where
-    C: blocking::Can,
-    C::Frame: Frame,
-{
-    let frame = can.receive().map_err(BlockingReceiveError::Driver)?;
-    ingest_classic_frame(driver, frame, timestamp_ms())
-        .map_err(|(frame, error)| BlockingReceiveError::InvalidFrame { frame, error })
 }

@@ -18,14 +18,14 @@
 
 ```toml
 [dependencies]
-odrive_can_driver = { version = "0.2.0", features = ["embedded-can"] }
+odrive_can_driver = { version = "0.3.0", features = ["embedded-can"] }
 ```
 
 按接入方式选择 feature；只使用协议编解码或共享状态机时可省略 `features`，默认是 `[]`。
 
 | feature | 接入方式 | 平台与配置 | 使用入口 |
 |---|---|---|---|
-| `embedded-can` | 实现 `embedded-can 0.4` 的 HAL，blocking 或非阻塞轮询 | 任何支持本 crate 的目标 | [轮询示例与时序](#embedded-can) |
+| `embedded-can` | 实现 `embedded-can 0.4` 的 HAL，非阻塞轮询 | 任何支持本 crate 的目标 | [轮询示例与时序](#embedded-can) |
 | `embassy-stm32` | 已配置的 STM32 FDCAN，原生异步收发 | 应用选择 STM32、引脚、时钟和位速率 | [依赖配置、异步示例与时序](#embassy-stm32) |
 | `socketcan` | Linux 非阻塞 SocketCAN，无异步运行时 | Linux 与 SocketCAN 接口 | [命令行示例与时序](#socketcan) |
 
@@ -74,7 +74,7 @@ assert_eq!(
 
 ## 从 `odrive-can-protocol` 迁移
 
-`odrive-can-protocol` 的 `0.1.x` 是旧的独立 crate；其实现已内置到本 crate。将 Cargo 依赖改为 `odrive_can_driver = "0.2.0"`，并把导入从 `odrive_can_protocol::...` 改为 `odrive_can_driver::protocol::...`。例如：
+`odrive-can-protocol` 的 `0.1.x` 是旧的独立 crate；其实现已内置到本 crate。将 Cargo 依赖改为 `odrive_can_driver = "0.3.0"`，并把导入从 `odrive_can_protocol::...` 改为 `odrive_can_driver::protocol::...`。例如：
 
 ```rust
 // 旧：use odrive_can_protocol::{encode, Command, NodeId};
@@ -83,43 +83,94 @@ use odrive_can_driver::protocol::{encode, Command, NodeId};
 
 旧独立 crate 的类型与本 crate 的内置类型不是同一 Rust 类型，即使名称和字段相同；同一个调用边界只能使用其中一套类型。迁移后删除旧依赖，不要同时混用两者。
 
-## 一次操作怎样完成
+## 操作、发送与查询接纳
 
-1. 为设备节点创建 `Driver::new(NodeId::new(node)?)`。
-2. 用 `prepare_command` 或 `prepare_query` 准备操作，取得 `OperationId`。这一步只验证和编码，没有发送。
-3. 调用对应后端的发送函数；它内部完成 `begin_send` 和发送结果记录。
-4. 持续接收并分发帧，同时用 `tick(now_ms)` 推进期限。接收会更新缓存，匹配的查询反馈可使操作成为 `Observed`。
-5. 用 `report(id)` 查看进展；终态后 `take_report(id)` 取走报告，再开始下一操作。`Unknown` 有额外处理要求，见下文。
+`Driver` 只维护一个操作槽。应用拥有总线、发送端点、接收端点、时钟和调度；等待 I/O 不占用 `&mut Driver`。准备、真实 I/O、结果回填是独立步骤，三个后端使用同一个状态机。
 
-一个 `Driver` 只有一个操作槽，**未取走的终态报告也占用它**。所有时刻以同一单调时钟的毫秒值表示，`deadline_ms` 是绝对期限。例如当前 `1000`、期限 `1100` 表示剩余 100 ms；反馈必须在提交后且严格早于期限才参与查询完成判断。
+1. 创建调用方持有的 `Session`，再创建 `Driver::new(&mut session, node)`。
+2. `prepare_command` / `prepare_query` 返回不可复制的 `SendPermit`。保存 `permit.id()` 用于观察报告；准备不发送帧。
+3. `begin_send(permit, now)` 一次消费凭证并生成 `TxAttempt`。后端每次轮询真实 I/O 前调用 `authorize_tx` 检查会话、操作、尝试、取消和期限。
+4. 应用轮询 TX、读取和分发 RX、调用 `tick`。后端等待时不持有 Driver；已撤销的尝试不能在下一次轮询时调用真实 TX。
+5. I/O 结束后用 `finish_tx` 一次消费尝试，记录提交或有证据的未提交。原始错误和被置换的 TX 帧归还总线所有者。
+6. 查询反馈先进入缓存与候选项。应用以 `pending_response` 取得候选，再选择 `accept_response`、`ignore_response` 或 `reject_response`。
+7. 用 `report(id)` 观察；终态用 `take_report(id)` 取走报告。未取走的报告和未解决的发送都占用唯一槽位。
+
+`Session` 的借用生命周期把凭证绑定到实际 Driver 会话。操作和尝试还具有独立身份；不能拿旧尝试完成重试，也不能在旧凭证仍存活时重建同一 Session 的 Driver。不同 Session 的凭证不能交叉使用。不要通过丢弃 Driver 绕过设备端未知副作用。
+
+### 时间合同
+
+所有准备、轮询、提交、接收、期限、缓存和报告统一使用 `Instant`（微秒时间点），时间跨度使用 `Duration`。用 `Instant::from_micros(value)` / `Duration::from_micros(value)` 显式构造，`as_micros()` 读取原值。绝对期限不包含期限本身。
+
+事件时间与处理时间分开：`occurred_at` / `received_at` 表示本地提交结果或接收事件，`processed_at` 表示状态机处理结果的时间。它们必须映射到同一个单调时钟域，但允许事件早于处理时间；迟到回填不等于时钟回退。后端在真实 I/O 返回后才采样结果时间。处理时钟回退会被拒绝，不能通过倒退时间延长发送资格。相同微秒值不能证明两个事件的因果顺序，因此查询要求 RX 严格晚于提交；等时刻帧仍保留在缓存中。
+
+Embassy 返回完整 `FdEnvelope`，包括原生 `ts`；映射到 Driver 时间域时不得先转为毫秒。SocketCAN 可保留原始 `CanTimestamps`，由应用启用对应 socket 时间戳选项并映射时钟域。embedded-can 的标准 trait 不提供硬件时间戳；使用应用的出队观察时间时，它不是设备采样时间，也不能证明排队帧的新鲜度。
+
+### 反馈缓存与完成是两件事
+
+成功解码的同节点回复更新缓存，包括完整未知状态和错误位。缓存更新本身不完成查询。候选必须属于当前操作、同节点、同类型、提交后的时间窗口且严格早于期限；应用规则只能进一步限制，不能绕过这些条件。
+
+| 应用选择 | 查询结果 | 缓存及提交事实 |
+|---|---|---|
+| `accept_response` | 合法候选使查询成为 `Observed` | 保存该反馈，保留提交时间 |
+| `ignore_response` | 丢弃当前候选，继续等反馈或期限 | 不回滚响应缓存或提交事实 |
+| `reject_response` | 明确拒绝并结束查询 | 保留已有提交时间；拒绝不等于未发送 |
+
+查询反馈先于 TX 结果回填到达时，可先保存为候选；回填真实提交时间后再进行时间匹配和应用接纳。不会从旧缓存自动完成新查询。每个操作只保留最新事件时间的候选，更旧的迟到帧不会替换它；应用需要逐帧审查时，应在分发每一帧后立即处理候选。
+
+`tick` 已报告查询超时时，事件时间仍在有效窗口内的延迟 RX/TX 可以继续参与接纳，直到应用 `take_report` 最终取走报告；取走之后不再追溯修改。应用取消或明确拒绝后不会被后续反馈恢复。应用负责旧帧隔离、来源连续性、接收队列水位等总线规则。CANSimple 没有请求序号，所以 `Observed` 只是符合规则的观察关联，不是因果 ACK。
+
+```mermaid
+sequenceDiagram
+    participant App as 应用 / 总线所有者
+    participant Core as Driver / Session
+    participant TX as 独立 TX 端点
+    participant RX as 独立 RX 端点
+    App->>Core: prepare_query → SendPermit
+    App->>Core: begin_send → TxAttempt
+    loop TX 仍待处理
+        App->>Core: tick / cancel / authorize_tx
+        alt 发送资格有效
+            App->>TX: 轮询真实 I/O
+            TX-->>App: Pending 或原始完成结果
+        else 资格已撤销
+            Note over App,TX: 不再轮询底层发送
+        end
+        App->>RX: 接收一帧
+        RX-->>App: 原生帧 / 完整时间戳 / 原始错误
+        App->>Core: ingest → 缓存与查询候选
+        Note over App,RX: 无关帧由应用继续分发
+    end
+    App->>Core: finish_tx，消费尝试并回填事件时间
+    App->>Core: 接纳 / 忽略 / 明确拒绝合法候选
+    Core-->>App: report / take_report
+```
+
+## 取消、期限与未知结果
+
+`tick` 和 `cancel` 撤销下一次发送资格；它们不会撤销已经入队的 CAN 帧，也不会停止电机。丢弃凭证或 future、普通取消、超时和原始 I/O 错误都不能单独证明未提交。
+
+| 情况 | 后续处理 |
+|---|---|
+| 尚未开始 I/O 的准备操作 | 可取消；没有本次发送副作用 |
+| 真实 I/O 返回 `WouldBlock` 且调用已结束 | 明确未入队，返回新的单次凭证，可由应用重试同一操作 |
+| 固定后端证明 `Pending` 未入队，且原 future 已结束 | 可消费尝试，记录有证据的取消未提交 |
+| 提交与取消竞争 | 保留真实提交事实，不能把已入队结果改写为未发送 |
+| 期限到达但发送仍未解决 | 撤销后续发送资格并保持未知隔离，不能自动重试 |
+| future / 凭证遗失或其他发送错误 | 结果按未知处理；先终止原发送任务并处理控制器队列，再显式解除未知隔离 |
+| 已提交查询超时或被应用拒绝 | 查询结束，但已提交事实保留；不能推断设备没有处理请求 |
+| 接收错误、FD/RTR/无关帧 | 归还原始结果给总线所有者，不改变已提交事实 |
+
+发送结果回填只消费对应尝试一次。提交事实不会因回填处理晚于期限而消失；同一微秒的提交和取消按已发生的实际 I/O 处理，不凭时间值猜测“未发送”。若提交事件本身越过期限，报告保留 `submitted_at` 并进入 `Unknown`。丢失尝试后可用保存的 id 调用 `cancel` 撤销资格；应用确认原 TX 已结束并处理了控制器待发队列后，才可 `acknowledge_unknown`、`take_report`。确认后报告仍是未知，不构成未发送证明。Heartbeat 始终不是写命令 ACK。本版移除了无法在等待期间推进期限的 blocking 封装；应用使用非阻塞或 Embassy 轮询入口。
 
 ## 发心跳、读状态与保活
 
-**Heartbeat 由 ODrive 周期发送，主机接收。** 当前协议没有 `Command::Heartbeat` 或 `Query::Heartbeat`；本库不伪造设备心跳，也不配置设备心跳周期。先在设备端配置周期，随后持续调用后端接收函数，读取缓存中的轴状态、完整错误位和接收时间：
+**Heartbeat 由 ODrive 周期发送，主机接收。** 当前协议没有 `Command::Heartbeat` 或 `Query::Heartbeat`。应用设置设备心跳周期，持续接收，并读取 `driver.cache()` 中的 `ResponseKind::Heartbeat`。新鲜度用同一微秒时钟和 `Duration` 判断；无新鲜样本不能当作 Idle 或无错误。
 
-```rust
-use odrive_can_driver::{Driver, ResponseKind, protocol::{AxisState, Response}};
-
-fn fresh_axis_state(driver: &Driver, now_ms: u64, max_age_ms: u64)
-    -> Option<(AxisState, u32)>
-{
-    if !driver.cache().heartbeat_is_fresh(now_ms, max_age_ms) {
-        return None;
-    }
-    match driver.cache().get(ResponseKind::Heartbeat)?.response {
-        Response::Heartbeat { axis_state, axis_error } => Some((axis_state, axis_error)),
-        _ => None,
-    }
-}
-```
-
-`None` 表示没有可用的新鲜状态，不能当作 Idle 或无错误。非零 `axis_error` 是设备错误位图；未知位也保留。`max_age_ms` 由应用根据设备发送周期和允许的延迟设置。
-
-如果“发心跳”指**主机保活**，应用可以按自己的调度周期调用 `prepare_query(Query::VbusVoltage, now_ms, deadline_ms)`，再通过后端真正发出并处理报告。在支持的 v0.5.1 固件中，寻址到该轴的 CANSimple 帧（包含 RTR 查询）会喂 watchdog。因此查询也会延长 watchdog，不能把持续查询后的存活误认为控制任务仍健康。库不创建后台保活任务；查询周期和 watchdog 超时由应用明确配置，上一操作结束并取走报告后才准备下一次。
+如果“发心跳”指主机保活，应用可以周期性准备并发送 `Query::VbusVoltage`。在支持的 v0.5.1 固件中，[节点匹配后、分派命令前就会喂 watchdog](https://github.com/odriverobotics/ODrive/blob/7831d795235e5ef8535e4b46621a0721b458ec8f/Firmware/communication/can_simple.cpp#L21-L38)，因此 RTR 查询也会延长 watchdog，不能据此认为控制任务仍健康；已锁存的 watchdog 错误也不会仅因再次喂狗而消失。库不创建后台保活任务；查询周期和 watchdog 超时由应用明确配置。
 
 ## 发指令、查询数据、清错误
 
-下面的值直接来自 `odrive_can_driver::protocol`。写指令传给 `prepare_command`，读取请求传给 `prepare_query`，两者随后都使用同一个后端发送入口。
+写指令传给 `prepare_command`，读取请求传给 `prepare_query`，随后使用对应后端推进凭证：
 
 | 目的 | 传入值 | 如何确认后续状态 |
 |---|---|---|
@@ -136,245 +187,123 @@ fn fresh_axis_state(driver: &Driver, now_ms: u64, max_age_ms: u64)
 | 读电机/编码器错误 | `Query::MotorError` / `Query::EncoderError` | `Response::MotorError(bits)` / `Response::EncoderError(bits)` |
 | 读母线电压/电流 | `Query::VbusVoltage` / `Query::Iq` | `Response::VbusVoltage(volts)` / `Response::Iq { setpoint, measured }` |
 
-例如准备清错：
-
-```rust
-use odrive_can_driver::{Driver, OperationId, PrepareError, protocol::Command};
-
-fn prepare_clear_errors(driver: &mut Driver, now_ms: u64, deadline_ms: u64)
-    -> Result<OperationId, PrepareError>
-{
-    driver.prepare_command(Command::ClearErrors, now_ms, deadline_ms)
-}
-```
-
-取得 `id` 后，分别调用 `embedded_can::transmit_nb` / `transmit_blocking`、`embassy::transmit(...).await` 或 `SocketCan::send`。完整发送、接收、期限和错误分支见[后端接入与时序](#后端接入与时序)。
-
-**写命令的 `Submitted` 只表示后端接受了帧。** 取走该报告后仍应持续接收；需要确认 Idle 或清错效果时，比较后续 Heartbeat 的 `received_at_ms` 与报告的 `submitted_at_ms`，并检查目标状态/错误位。CANSimple 没有事务序号，Heartbeat 不是命令 ACK，查询的 `Observed` 也只表示在时间窗口内观察到同节点同类型反馈。
-
-清错不会自动进入闭环；进入闭环不会自动设置安全目标；写零速度也不等于进入 Idle。这些步骤由应用根据设备模式、限值和保护策略显式安排。
-
-## 异常处理
-
-处理顺序是：**保留原始错误 → 查看 `report(id)` → 依据发送进展处理 → 满足条件后取走报告**。不要仅凭一个 I/O 错误判断“设备没收到”。
-
-| 情况 | 含义与处理 |
-|---|---|
-| `PrepareError::Encode`、`DeadlineElapsed`、`ClockRollback` | 准备失败，没有此次发送。修正参数、绝对期限或时钟来源；不要跳过验证 |
-| `PrepareError::Busy` | 上一操作或尚未取走的报告占用槽位。先处理它，不重建 Driver 来绕过未知状态 |
-| TX `WouldBlock` | 明确未被后端接受，通常仍为 `Prepared`；继续接收和检查期限，稍后重试**同一 id** |
-| RX 无帧 | embedded-can 返回 `Empty`，SocketCAN 返回 `WouldBlock`；不是设备故障，继续调度并 `tick` |
-| `Failed` / `Cancelled` | 此操作已知未提交；取走报告后由应用决定是否发起新操作。`cancel` 仅适用于 `Prepared` |
-| `TimedOut` | 看 `submitted_at_ms`：`None` 表示已知未提交，`Some` 表示查询已提交但反馈未及时观察到。取走报告，不据此认定设备未执行 |
-| 发送 I/O 错误、发送 future 中途丢弃、接受后无法记录提交 | 可能是 `Unknown`。保留错误和报告，不自动重试；`take_report` 此时返回 `UnknownPending` |
-| `Unknown` 的后续操作 | 先由应用确认底层不会再提交/迟到发送该帧，才调用 `acknowledge_unknown(id)`，随后 `take_report(id)`。这只释放追踪槽位，不证明设备未执行或已取消 |
-| 接收错误、FD/RTR/扩展帧或无法解码的帧 | 处理后端错误与分类，并将原始帧交还总线分发方；接收失败不回滚已经提交的命令，也不自动清错或复位外设 |
-| Heartbeat 过期、设备错误位非零 | 通信新鲜度与设备健康分开判断；保存完整错误位，再由应用决定停止、诊断、清错或恢复 |
-
-blocking 接口没有可由本库保证的超时中断；嵌入式异步接口须由应用安排 timer/取消点。`tick` 只推进驱动记录，不会终止阻塞调用、撤销控制器队列或停止电机。SocketCAN 默认关闭错误通知，若需要总线错误帧，须通过 `bus.socket().set_error_filter(...)` 显式启用，见示例。
+**写命令的 `Submitted` 只表示后端接受了帧。** 清错、闭环、目标设置和停止由应用显式安排。需要确认清错或 Idle 效果时，持续接收新的 Heartbeat，比较它的接收时间与提交时间，并检查状态和错误。机械停止仍需应用自己的反馈判据。
 
 ## 后端接入与时序
 
-三个后端共用前述操作流程。以下源码展示实际收发、期限推进和错误分支；外设配置和调度由应用提供。
-
-| 示例 | 用法 | 应用提供什么 |
+| 示例 | 应用提供什么 | 等待边界 |
 |---|---|---|
-| [embedded_can.rs](examples/embedded_can.rs) | 主循环反复调用 `poll_once` | 实现 `embedded_can::nb::Can` 的 HAL、单调时钟 |
-| [embassy_stm32.rs](examples/embassy_stm32.rs) | 用 `exchange_until(...).await` 推进一次操作 | 已配置的 `Can`、executor、截止 future、时间戳映射与帧分发回调 |
-| [socketcan.rs](examples/socketcan.rs) | Linux CLI，运行命令见下文 | 已启用的 SocketCAN 接口、节点号、操作参数 |
+| [embedded_can.rs](examples/embedded_can.rs) | 单独的 `CanTx` / `CanRx` 端点、单调时钟及主循环 | 每次非阻塞调用的真实 `WouldBlock` |
+| [embassy_stm32.rs](examples/embassy_stm32.rs) | 已配置的 FDCAN `CanTx` / `CanRx`、executor、timer、时间映射与分发回调 | 固定 Embassy `CanTx::write` 的真实 `Pending` |
+| [socketcan.rs](examples/socketcan.rs) | 已启用的 Linux CAN 接口、节点和显式操作 | 非阻塞 socket 调用的真实 `WouldBlock` |
 
-前两个是 `no_std` library 示例，可将其中的接入函数放入应用；SocketCAN 示例可直接运行。
+前两个是 `no_std` library 示例；SocketCAN 是可运行 CLI。库不清空 RX、不重配或重建外设。
 
 ### embedded-can
 
-应用依赖：
-
 ```toml
 [dependencies]
-odrive_can_driver = { version = "0.2.0", features = ["embedded-can"] }
+odrive_can_driver = { version = "0.3.0", features = ["embedded-can"] }
 embedded-can = "0.4.1"
 ```
 
-配置支持 `embedded-can 0.4` 的 HAL 后创建 `Driver`，用 `prepare_query(Query::VbusVoltage, now_ms, deadline_ms)` 取得 `id`。在自己的主循环或调度器中反复调用示例的 `poll_once`，每次从同一单调时钟重新采样：
+本库的 `embedded_can::CanTx` / `CanRx` 支持分离端点；原来的 `embedded_can::nb::Can` 也通过适配接入。应用在每轮先推进时钟，处理 RX，再推进 TX；有持续 RX 时也要公平推进发送与期限。协议适配保留原生 Classic/RTR 帧、原始错误和 `displaced` 置换帧。
 
-- 每轮检查期限、接收至多一帧，并在仍为 `Prepared` 时尝试发送；有 RX 流量也不会跳过 TX 推进。
-- 将接收结果中的原始帧交回共享总线分发器；发送结果中的 `displaced` 是被替换的旧 TX 帧，也须交回总线所有者。
-- TX `WouldBlock` 表示尚未接受该帧，保留同一 `id` 到下一轮；其他 TX 错误必须结合报告判断，通常保留为 `Unknown`。
-- 通过 `driver.take_report(id)` 提取终态。查询等待期间返回 `Pending`，`Unknown` 返回 `UnknownPending`；写命令本地 `Submitted` 已可提取。不要仅按状态名把所有 `Submitted` 都当作仍在等待。
-
-把查询替换为 `prepare_command(Command::ClearErrors, now_ms, deadline_ms)` 或其他 [Command](#发指令查询数据清错误)，轮询方法不变。操作结束后仍要继续接收，才能维护 Heartbeat 时效与设备状态；没有活动操作时可直接调用 `receive_nb`。
+`embedded-can 0.4` trait 无法表达 FD 和硬件接收时间戳，拥有这些信息的 HAL 应用须在原生层分发，再把协议视图及完整时间送入 Driver，不能在转换时丢失原始数据。旧的 `transmit_blocking` / `receive_blocking` 封装已移除，只有 blocking HAL 的应用需自行安排同步 I/O 并遵守凭证及结果回填合同。
 
 ```mermaid
 sequenceDiagram
-    participant App as 应用调度循环
+    participant App as 应用循环
     participant Core as Driver
-    participant IO as embedded-can 后端 / HAL
-    participant Device as ODrive
-    App->>Core: prepare_query(query, now, deadline)
-    Core-->>App: OperationId / Prepared
-    loop 持续调度，直到报告可处理
-        App->>Core: tick(now)
-        App->>IO: receive_nb(driver, can, clock)
-        opt 收到原始帧
-            Device-->>IO: Heartbeat / 查询反馈 / 其他节点帧
-            IO->>Core: ingest(frame, rx_ms)
-            IO-->>App: 原始帧与分类，交由应用分发
-        end
-        opt 仍为 Prepared
-            App->>IO: transmit_nb(driver, id, can, clock)
-            IO->>Core: begin_send → Dispatching
-            alt HAL WouldBlock
-                IO->>Core: would_block → Prepared 或到期
-                IO-->>App: WouldBlock，下轮继续同一 id
-            else HAL 接受帧
-                IO->>Core: submitted → Submitted
-                IO-->>App: Submitted，归还可能的 displaced
-                IO->>Device: 控制器推进已接受帧的实际发送
-                Note over IO,Device: 本地接受不保证设备已收到或执行
-            else HAL 其他错误
-                IO->>Core: guard 析构 → Unknown
-                IO-->>App: 原始错误，停止自动重发
-            end
-        end
-        App->>Core: report / take_report
+    participant TX as CanTx / HAL
+    App->>Core: begin_send，消费凭证
+    App->>Core: authorize_tx，检查资格
+    App->>TX: transmit，一次非阻塞调用
+    alt WouldBlock
+        TX-->>App: 确定未入队
+        App->>Core: finish_tx → 新的重试凭证
+    else 本地接受
+        TX-->>App: 原生 displaced 帧
+        App->>Core: finish_tx → Submitted
+    else 原始错误
+        TX-->>App: 原始错误
+        App->>Core: 未知结果隔离，禁止自动重试
     end
+    Note over App,TX: RX 独立推进，所有原始帧由应用继续分发
 ```
-
-HAL 只有 blocking 接口时，改用 `transmit_blocking`、`receive_blocking`。`embedded-can::blocking::Can` 没有标准的取消或超时中断能力：本库只能在调用前后检查时间，无法保证阻塞期间仍能推进期限。需要周期调度时优先使用 `nb` 入口。
 
 ### embassy-stm32
 
-在**应用工作区根**配置依赖与固定修订：
+在**应用工作区根**配置依赖与固定修订（Cargo 不向下游传递 library 的 patch）：
 
 ```toml
 [dependencies]
-odrive_can_driver = { version = "0.2.0", features = ["embassy-stm32"] }
+odrive_can_driver = { version = "0.3.0", features = ["embassy-stm32"] }
 embassy-stm32 = { version = "0.6.0", features = ["stm32h723vg"] }
 
 [patch.crates-io]
 embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", rev = "7b08a9c7d9a9fe620f4be25c4e7b86dd29f09f54" }
 ```
 
-registry `embassy-stm32 0.6.0` 只在 DLC 为 0 时设置发送 RTR 位，而本协议查询使用 DLC 8；上述修订修复了它。Cargo 不向下游传递 library 的 patch，所以只启用 feature 不足以采用修复。该依赖组合使用 Rust 1.98.1。`stm32h723vg` 是芯片 feature 示例，应用应选择自己的 FDCAN 芯片。
+registry `embassy-stm32 0.6.0` 的 RTR DLC 8 发送缺陷由上述修订修复。取消证据同样仅针对这个固定修订的**非缓冲** `CanTx::write`：[`TxMode::write_generic`](https://github.com/embassy-rs/embassy/blob/7b08a9c7d9a9fe620f4be25c4e7b86dd29f09f54/embassy-stm32/src/can/fdcan.rs#L984-L999) 在一次 poll 内同步调用寄存器发送，入队成功直接 `Ready`，只有 `WouldBlock` 才 `Pending`。[寄存器层的两个 `WouldBlock` 分支](https://github.com/embassy-rs/embassy/blob/7b08a9c7d9a9fe620f4be25c4e7b86dd29f09f54/embassy-stm32/src/can/fd/peripheral.rs#L227-L259) 都发生在写入新帧之前；成功置换旧帧则通过 `Ready` 返回该帧。该 future 结束后没有后台重试提交路径。不能将这个结论推广到 buffered CAN、其他 HAL 或其他 Embassy revision。
 
-应用初始化芯片、FDCAN 引脚、时钟与位速率，并拥有 executor。示例 `exchange_until` 对已有的 `Can` 和 `Driver` 推进一次操作：
-
-1. 应用先用 `prepare_query(Query::VbusVoltage, now_ms, deadline_ms)` 或 `prepare_command(...)` 取得并保存 `id`，再传给 `exchange_until`；外层取消 future 后仍可使用这个 `id` 检查结果。
-2. 同时提供单调 `now_ms`、在该操作绝对期限完成的 timer future、将 `FdEnvelope` 时间戳映射到该时钟域的函数，以及 `Handlers { tx, rx }` 两个结果回调。回调须处理被置换的 TX 帧和每个原始 RX 帧，不能吞掉其他设备的流量。
-3. 示例将原生异步发送与截止 future 竞速；查询接受后，循环将接收与**同一个**截止 future 竞速，直到匹配回复或截止。Heartbeat 更新缓存，无关帧交给回调后继续等同一操作，绝不重新 prepare。
-4. 写命令本地 `Submitted`、查询 `Observed` 或确定的超时等终态会取出报告；`Unknown` 只返回快照，继续占用操作槽，应用不能自动重发。接收 I/O 错误、时钟错误或外层取消后，也须用保存的 `id` 查看报告。
-
-截止 future 必须对应准备操作时的 `deadline_ms`。发送尚未被首次 poll 时就截止，没有开始 I/O；若发送已开始再被取消，结果可能为 `Unknown`。RX 等待被取消不会撤销已提交的查询，随后仍需 `tick`。本例不保证设备取消，也不自动解除未知状态。
-
-发送和接收都借用同一个 `Can`/`Driver`，应由统一总线任务顺序调度，不能把同一可变借用同时交给两个任务。
+应用通过 `Can::split` 获取 `CanTx` / `CanRx`。TX 每次 poll 前经过 Driver 门禁；RX 保留完整 `FdEnvelope`，包括 Classic/FD/RTR 标志和原生时间戳。启用 Embassy `time`（通常由应用的 `time-driver-*` 启用）时，`ts` 是 Embassy `Instant`，可用 `as_micros()` 映射；未启用时是原生 16-bit 控制器时间戳，应用须处理其时钟域与回绕，不能直接当作 Driver 绝对时间。TX 等待期间应用照常接收、推进期限及响应取消。示例展示同一个调度循环中的这些步骤；库不另建任务、不加内部锁。
 
 ```mermaid
 sequenceDiagram
-    participant App as 应用 / executor / timer
+    participant App as 应用 / executor
     participant Core as Driver
-    participant IO as Embassy 后端 / FDCAN
-    participant Device as ODrive
-    App->>Core: prepare_query(query, now, deadline)
-    Core-->>App: id / Prepared
-    App->>IO: transmit(...).await，与 deadline 竞速
-    alt 截止先完成，发送尚未首次 poll
-        App->>Core: tick(now)，Prepared → TimedOut
-    else 发送开始后截止或被取消
-        IO->>Core: begin_send → Dispatching
-        IO->>Core: guard 析构 → Unknown
-    else FDCAN 接受帧
-        IO->>Core: begin_send → Dispatching
-        IO->>Core: submitted → Submitted
-        IO-->>App: 本地提交结果与 displaced
-        IO->>Device: 总线发送 RTR（提交后由控制器推进）
-        loop 查询未完成，同时等待原 deadline
-            App->>IO: receive_with_timestamp(...).await
-            Device-->>IO: Heartbeat / 回复 / 其他帧
-            IO->>Core: ingest(frame, rx_ms)
-            IO-->>App: 原始帧、分类或 BusError
-        end
-        alt 匹配回复在期限内
-            Core-->>App: Observed
-        else 接收等待截止
-            App->>Core: tick(now) → TimedOut
+    participant TX as Embassy CanTx
+    participant RX as Embassy CanRx
+    App->>Core: authorize_tx
+    App->>TX: poll 原生 write
+    alt Ready
+        TX-->>App: 已提交及 displaced
+        App->>Core: 记录真实提交时间
+    else Pending
+        TX-->>App: 该次未入队
+        Note over App,TX: 结束该次原生 future，消除继续提交路径
+        App->>RX: poll read_fd，保留完整 Envelope
+        App->>Core: ingest / tick / cancel
+        alt 已取消或到期
+            App->>Core: 消费尝试及后端未提交证据
+            Note over App,TX: 不再进入 write
+        else 仍有效
+            Note over App,TX: 下轮重新检查资格后才允许 poll
         end
     end
-    App->>Core: report；可提取时 take_report
 ```
-
-发送清错或状态指令时，用 `prepare_command` 得到 `id` 后调用 `embassy::transmit(&mut can, &mut driver, id, now_ms).await`，并使用同样的 deadline 处理。写命令的 `Submitted` 报告可立即取走；随后继续接收新的 Heartbeat，观察设备状态或错误变化。
 
 ### socketcan
 
-仅支持 Linux；使用非阻塞 `socketcan 4`，无 Tokio 等运行时。
-
-```toml
-[dependencies]
-odrive_can_driver = { version = "0.2.0", features = ["socketcan"] }
-# 应用需要配置 socket 错误过滤器时直接使用此依赖。
-socketcan = { version = "4", default-features = false }
-```
-
-先由系统配置并启用 CAN 接口及正确位速率，再运行仓库中的 CLI。以下 `can0` 和 node `1` 应替换为你的配置：
+仅支持 Linux；使用非阻塞 `socketcan 4`，无异步运行时。接口与位速率由系统先配置。以下 `can0` 和 node `1` 应替换为你的配置：
 
 ```sh
-# 只接收设备 Heartbeat，输出轴状态和错误；不会发送主机心跳。
 cargo run --features socketcan --example socketcan -- can0 1 heartbeat
-# RTR 查询电压、编码器位置/速度、电机错误。
 cargo run --features socketcan --example socketcan -- can0 1 vbus
 cargo run --features socketcan --example socketcan -- can0 1 encoder
 cargo run --features socketcan --example socketcan -- can0 1 motor-error
-# 这两条会发送实际写命令；分别调用，不自动进入闭环。
 cargo run --features socketcan --example socketcan -- can0 1 clear-errors
 cargo run --features socketcan --example socketcan -- can0 1 idle
 ```
 
-还支持 `state`（等同 `heartbeat`）、`encoder-error`、`velocity <turn/s> [torque_ff_Nm]`。速度参数由应用根据设备模式和许可选择；该命令只写目标，不进入闭环，也不在 CLI 退出时自动归零或 Idle。
+还支持 `state`、`encoder-error`、`velocity <turn/s> [torque_ff_Nm]`。速度命令只写目标，不进入闭环，也不在 CLI 退出时自动归零或 Idle。CLI 每次只执行指定操作，窗口 1 s；写命令以本地 `Submitted` 成功退出，查询需应用接纳后 `Observed`。超时、I/O 失败或 `Unknown` 非零退出。
 
-CLI 每次只执行指定操作，等待窗口为 1 s。写命令以本地 `Submitted` 成功退出；查询必须为 `Observed`，心跳接收必须观察到设备 Heartbeat。超时、I/O 失败或 `Unknown` 为非零退出。需要确认清错/Idle 效果时，继续接收并检查新的 Heartbeat；不能用上一个进程的成功退出码代替设备反馈。
+本示例启用其 socket 的错误过滤器；原始 Classic、RTR、FD 和错误通知均保留。共享应用应统一读取和分发，不能让多个消费者争抢同一个接收队列。发送成功是内核接受；只有 `WouldBlock` 证明该次未提交，其他错误保留未知结果。
 
-示例显式打开该 socket 的错误通知过滤器，输出原始错误分类；这不会修改整个 CAN 接口。它拥有独立描述符并记录收到的无关帧。共享应用应将 `receive` 返回的 `frame` 交给自己的统一分发器，也可使用 `receive_frame` 分类已经读出的帧。
+## 从 0.2 Driver API 迁移
 
-```mermaid
-sequenceDiagram
-    participant App as Linux 应用循环
-    participant Core as Driver
-    participant IO as SocketCan / Linux 内核
-    participant Device as ODrive
-    App->>IO: open(interface)，设置本 socket 错误过滤器
-    App->>Core: prepare_query(query, now, deadline)
-    Core-->>App: id / Prepared
-    loop 仍为 Prepared 且未到期
-        App->>IO: send(driver, id, clock)
-        IO->>Core: begin_send → Dispatching
-        alt 内核 WouldBlock
-            IO->>Core: would_block → Prepared 或到期
-        else 内核接受帧
-            IO->>Core: submitted → Submitted
-        else 其他写入错误
-            IO->>Core: guard 析构 → Unknown
-        end
-        App->>Core: tick(now) / report
-    end
-    Note over Core,IO: 写命令到 Submitted 即可取报告；查询继续等待
-    opt 查询已在本地 Submitted
-        IO->>Device: 已接受的 RTR 经 CAN 接口发出一次
-        loop 查询仍等待且未到期
-            Device-->>IO: 回复或其他帧
-            App->>IO: receive(driver, clock)
-            IO->>Core: ingest(frame, observed_ms)
-            IO-->>App: 原始帧与分类 / WouldBlock / I/O 错误
-            App->>Core: tick(now) / report
-        end
-    end
-    App->>Core: take_report，或处理 Unknown
-```
+这是 Driver 公共接口的破坏性调整，协议命令、编码和固件支持范围不变；不保留第二套旧状态机。
 
-`receive` 返回 `WouldBlock` 时等待下一轮，不能把它当作设备错误；`send` 返回 `WouldBlock` 才允许重试同一操作。其他发送错误可能已产生副作用，按报告处理。出队观察时间不是硬件线上采样时间，不能用它证明队列中的帧刚刚由设备产生。
-
-## 共享总线
-
-调用方统一读取、分发和提交发送。后端返回无关帧与可能被置换的 TX 帧；共享总线应用须继续处理它们。`embedded-can` trait 只表达 Classic/RTR，FD 和底层错误信息应在原生 HAL 层分发；Embassy 与 SocketCAN 保留原生帧形态。库不清空 RX、不重配总线，也不重建共享外设。
+| 旧接口 / 行为 | 新接口 / 行为 |
+|---|---|
+| `Driver::new(node)` | 应用持有 `Session`；`Driver::new(&mut session, node)` |
+| `prepare_*` 返回 `OperationId` | 返回一次消费的 `SendPermit`；用 `permit.id()` 保存观察标识 |
+| `SendAttempt` 长期借用 Driver | `TxAttempt` 独立持有身份；每次实际发送短暂检查 Driver 门禁 |
+| `*_ms: u64` | 明确的 `Instant` / `Duration` 微秒类型；字段移除 `_ms` |
+| 后端内部从 id 查帧并开始 I/O | 传递线性凭证 / 尝试，分开授权、真实 I/O 与结果回填 |
+| `ingest` 自动完成匹配查询 | `ingest` 缓存并生成候选；应用明确接纳、忽略或拒绝 |
+| 丢弃发送 guard 后处理未知 | 保留当前尝试与原始结果；停止旧 I/O 后按证据处置，不能自动重试 |
 
 ## 协议支持范围
 

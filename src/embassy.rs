@@ -1,113 +1,206 @@
 // Copyright The odrive-can-driver Contributors
-//! Embassy STM32 的 FDCAN 原生异步适配。
+//! Embassy STM32 FDCAN split-endpoint adapter.
 //!
-//! 本模块面向具有 FDCAN 的芯片，直接使用 Embassy 的 `Can::write` 与 `Can::read_fd`。
-//! 应用负责配置外设、统一共享总线调度和为 `received_at_ms` 提供单调时钟。
+//! [`EmbassyTx`] owns one [`crate::TxAttempt`], while each [`EmbassyTx::poll`] call only
+//! temporarily borrows Embassy's [`CanTx`]. It authorizes the exact attempt immediately before
+//! one native poll, so applications can keep RX, deadlines, and cancellation in their own loop.
 //!
-//! 消费方工作区根必须将 `embassy-stm32` patch 到 Embassy Git revision
-//! `7b08a9c7d9a9fe620f4be25c4e7b86dd29f09f54`，配置见仓库 README。
-//! crates.io 的 `embassy-stm32 0.6.0` 仅在 DLC 为 0 时设置 FDCAN RTR 位，而 CANSimple
-//! 查询使用 DLC 8；该修订正确保留 RTR 位。Cargo 不向消费方传递 library 的 patch。
+//! The cancellation proof is specific to Embassy revision
+//! `7b08a9c7d9a9fe620f4be25c4e7b86dd29f09f54`: `TxMode::write_generic` returns
+//! `Poll::Pending` only when `Registers::write` returned `WouldBlock`, before the new frame is
+//! put in message RAM. This adapter drops that native future before returning `Pending`.
 
-use crate::protocol::compat::embassy::FromEmbassyError;
+use core::{
+    future::Future,
+    task::{Context, Poll},
+};
+
 use embassy_stm32::can::{
-    Can,
+    CanRx, CanTx,
     enums::BusError,
     frame::{FdEnvelope, FdFrame, Frame},
 };
 
-use crate::{AttemptError, BeginSendError, Driver, IngestResult, OperationId};
+use crate::protocol::compat::embassy::FromEmbassyError;
+use crate::{
+    AttemptError, BeginSendError, Driver, IngestResult, Instant, SendPermit, TxAttempt,
+    TxCompletion, TxOutcome,
+};
 
-/// FDCAN 发送的本地结果。
-///
-/// `Submitted` 只表示 Embassy 已将新帧交给本地队列。若 `displaced` 为 `Some`，该帧此前
-/// 已由同一个共享控制器排队，但被本操作替换；调用方必须继续处理该原生帧。
-#[derive(Debug)]
-pub enum EmbassyTransmit {
-    /// 新帧已提交，携带可能被替换的原生经典帧。
-    Submitted {
-        /// 被 FDCAN 队列替换的帧；该帧不属于本 driver 的所有权。
-        displaced: Option<Frame>,
-    },
-    /// FDCAN 已接受新帧，但 core 无法以调用方给出的时钟确认提交状态。
+/// A split FDCAN TX operation. It does not borrow [`Driver`] between [`Self::poll`] calls.
+#[must_use]
+pub struct EmbassyTx<'s> {
+    attempt: Option<TxAttempt<'s>>,
+}
+
+impl<'s> EmbassyTx<'s> {
+    /// Consumes a prepared permit and opens the first TX gate.
+    pub fn begin(
+        driver: &mut Driver<'s>,
+        permit: SendPermit<'s>,
+        processed_at: Instant,
+    ) -> Result<Self, BeginSendError> {
+        Ok(Self {
+            attempt: Some(driver.begin_send(permit, processed_at)?),
+        })
+    }
+
+    /// Polls one actual Embassy `CanTx::write` attempt.
     ///
-    /// 操作 guard 已进入 `Unknown`；即使本变体仍保留 `displaced`，调用方也不得自动重试。
-    Uncertain {
-        /// 已被替换的原生帧，仍须交还共享总线调度器。
+    /// The adapter samples `now` immediately before native polling for the authorization gate and
+    /// again only after the native future has returned `Ready`, so it never backfills a queue
+    /// result with a speculative pre-poll time. All samples are monotonic microseconds in the
+    /// driver's clock domain. A returned `Pending` owns no live Embassy future.
+    pub fn poll<F>(
+        &mut self,
+        tx: &mut CanTx<'_>,
+        driver: &mut Driver<'s>,
+        context: &mut Context<'_>,
+        mut now: F,
+    ) -> Poll<Result<EmbassyTransmit<'s>, EmbassyTxError>>
+    where
+        F: FnMut() -> Instant,
+    {
+        let attempt = self
+            .attempt
+            .take()
+            .expect("EmbassyTx polled after completion");
+        let encoded = match driver.authorize_tx(&attempt, now()) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.attempt = Some(attempt);
+                return Poll::Ready(Err(EmbassyTxError::Attempt(error)));
+            }
+        };
+        let frame = Frame::from(&encoded);
+        let write = tx.write(&frame);
+        let mut write = core::pin::pin!(write);
+        match write.as_mut().poll(context) {
+            Poll::Pending => {
+                self.attempt = Some(attempt);
+                Poll::Pending
+            }
+            Poll::Ready(displaced) => {
+                let occurred_at = now();
+                let processed_at = now();
+                let completion =
+                    driver.finish_tx(attempt, TxOutcome::Submitted { occurred_at }, processed_at);
+                Poll::Ready(Ok(EmbassyTransmit::Submitted {
+                    displaced,
+                    completion,
+                }))
+            }
+        }
+    }
+
+    /// Records proven cancellation after this wrapper's last native future has ended.
+    ///
+    /// Every native future is created and dropped inside [`Self::poll`]. Dropping this wrapper
+    /// alone is deliberately conservative and leaves the core operation uncertain.
+    pub fn cancel_unsubmitted(
+        mut self,
+        driver: &mut Driver<'s>,
+        occurred_at: Instant,
+        processed_at: Instant,
+    ) -> Result<(), EmbassyTxError> {
+        let attempt = self
+            .attempt
+            .take()
+            .expect("EmbassyTx cancelled after completion");
+        driver
+            .cancel_unsubmitted(attempt, occurred_at, processed_at)
+            .map_err(EmbassyTxError::Attempt)
+    }
+
+    /// Retains `Unknown` when the caller cannot provide cancellation evidence.
+    pub fn abandon(
+        mut self,
+        driver: &mut Driver<'s>,
+        processed_at: Instant,
+    ) -> Result<(), EmbassyTxError> {
+        let attempt = self
+            .attempt
+            .take()
+            .expect("EmbassyTx abandoned after completion");
+        driver
+            .abandon_attempt(attempt, processed_at)
+            .map_err(EmbassyTxError::Attempt)
+    }
+}
+
+/// A terminal local FDCAN TX result and the core's next action.
+#[derive(Debug)]
+pub enum EmbassyTransmit<'s> {
+    /// FDCAN accepted the new frame. The displaced frame remains caller-owned shared-bus data.
+    Submitted {
+        /// Original displaced Classic frame, if priority replacement occurred.
         displaced: Option<Frame>,
-        /// core 拒绝记录提交的原因。
-        error: AttemptError,
+        /// Core completion, or a clock/deadline diagnostic after FDCAN has already accepted the
+        /// frame. The native `displaced` frame remains available in either case.
+        completion: Result<TxCompletion<'s>, AttemptError>,
     },
 }
 
-/// Embassy 接收路径的结果。
+/// Failure before or while recording a TX result.
+#[derive(Debug)]
+pub enum EmbassyTxError {
+    /// The core revoked the attempt or rejected time/backfill data.
+    Attempt(AttemptError),
+}
+
+/// A raw FDCAN receive outcome. The full envelope is always retained.
 #[derive(Debug)]
 pub enum EmbassyReceive {
-    /// 原生帧及 core 对它的协议分类。
-    ///
-    /// 即使分类为 `DecodeError` 或 `Unrelated`，原生 FDCAN 容器也保留给共享总线调用方。
+    /// A raw frame with its protocol classification.
     Frame {
-        /// 原始 FDCAN 容器，保留 Classic、FD 和 RTR 标志。
-        frame: FdFrame,
-        /// 此 driver 的协议分类。
+        /// Original frame plus Embassy controller timestamp.
+        envelope: FdEnvelope,
+        /// Protocol classification; unrelated and decode-failed frames remain in `envelope`.
         classification: IngestResult,
     },
-    /// 原生帧头部无法安全转换为协议视图，帧和原因一并归还。
+    /// Protocol view conversion failed but the complete native frame remains available.
     Invalid {
-        /// 保持原始 FDCAN/Classic/RTR 标志的帧。
-        frame: FdFrame,
-        /// 转换失败原因。
+        /// Original frame plus Embassy controller timestamp.
+        envelope: FdEnvelope,
+        /// Conversion error.
         error: FromEmbassyError,
     },
 }
 
-/// 异步提交一个已准备的 Classic CANSimple 帧。
+/// Awaits one raw envelope from an application-owned split FDCAN RX endpoint.
 ///
-/// `now_ms` 在调用底层 `write` 前后分别读取，必须与 [`Driver::prepare_command`] 和
-/// [`Driver::prepare_query`] 使用同一单调毫秒时钟。future 在 `write` 等待期间被取消时，
-/// `SendAttempt` 析构会把本操作记为 `Unknown`，因为 FDCAN 可能已经接收该帧。若返回置换
-/// 帧，新帧已经是 `Submitted`，置换帧仅供共享总线调用方另行处理。
-pub async fn transmit(
-    can: &mut Can<'_>,
-    driver: &mut Driver,
-    id: OperationId,
-    mut now_ms: impl FnMut() -> u64,
-) -> Result<EmbassyTransmit, BeginSendError> {
-    let attempt = driver.begin_send(id, now_ms())?;
-    let frame = Frame::from(attempt.frame());
-    let displaced = can.write(&frame).await;
-    match attempt.submitted(now_ms()) {
-        Ok(()) => Ok(EmbassyTransmit::Submitted { displaced }),
-        Err(error) => Ok(EmbassyTransmit::Uncertain { displaced, error }),
+/// This function deliberately does not borrow [`Driver`]. After awaiting it, map the intact
+/// [`FdEnvelope::ts`] into the driver's monotonic microsecond domain and call
+/// [`ingest_fd_envelope`] with only a short driver borrow. Raw [`BusError`] is returned directly.
+pub async fn receive(rx: &mut CanRx<'_>) -> Result<FdEnvelope, BusError> {
+    rx.read_fd().await
+}
+
+/// Classifies an application-owned raw envelope without dropping its timestamp or frame.
+pub fn ingest_fd_envelope(
+    driver: &mut Driver<'_>,
+    envelope: FdEnvelope,
+    received_at: Instant,
+) -> EmbassyReceive {
+    match crate::protocol::FrameRef::try_from(&envelope.frame) {
+        Ok(view) => EmbassyReceive::Frame {
+            classification: driver.ingest(view, received_at),
+            envelope,
+        },
+        Err(error) => EmbassyReceive::Invalid { envelope, error },
     }
 }
 
-/// 异步读取一帧 FDCAN 容器并交给共享 core 分类。
-///
-/// 使用 `read_fd` 而非 Classic-only `read`，以便无关的 FD、RTR 和 Classic 帧保持在
-/// [`FdFrame`] 容器中返回。`received_at_ms` 在帧已出队后由 `timestamp_ms` 计算，调用方可
-/// 将 `FdEnvelope::ts` 映射到自己的单调毫秒时钟。若使用主机观察时刻，它只表示出队观察，
-/// 不能证明线上采样新鲜；本模块不会清空可能更早到达的 RX 队列。
-pub async fn receive_with_timestamp(
-    can: &mut Can<'_>,
-    driver: &mut Driver,
-    timestamp_ms: impl FnOnce(&FdEnvelope) -> u64,
-) -> Result<EmbassyReceive, BusError> {
-    let envelope = can.read_fd().await?;
-    let received_at_ms = timestamp_ms(&envelope);
-    Ok(ingest_fd_frame(driver, envelope.frame, received_at_ms))
-}
+/// Split Embassy FDCAN transmitter type for application signatures.
+pub type EmbassyCanTx<'d> = CanTx<'d>;
+/// Split Embassy FDCAN receiver type for application signatures.
+pub type EmbassyCanRx<'d> = CanRx<'d>;
 
-/// 将一个由共享总线调用方拥有的 FDCAN 帧交给 core 分类。
-///
-/// 所有成功构造协议视图的帧都会连同原生容器返回；分类可能是 `Message`、`Unrelated` 或
-/// `DecodeError`。因此协议解码在节点过滤前拒绝扩展 ID 或 FD 时，帧也不会被吞掉。
-pub fn ingest_fd_frame(driver: &mut Driver, frame: FdFrame, received_at_ms: u64) -> EmbassyReceive {
-    match crate::protocol::FrameRef::try_from(&frame) {
-        Ok(view) => EmbassyReceive::Frame {
-            classification: driver.ingest(view, received_at_ms),
-            frame,
-        },
-        Err(error) => EmbassyReceive::Invalid { frame, error },
+/// Returns the raw FDCAN frame without changing its classification.
+pub fn raw_frame(receive: &EmbassyReceive) -> &FdFrame {
+    match receive {
+        EmbassyReceive::Frame { envelope, .. } | EmbassyReceive::Invalid { envelope, .. } => {
+            &envelope.frame
+        }
     }
 }

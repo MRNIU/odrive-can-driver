@@ -1,181 +1,262 @@
 // Copyright The odrive-can-driver Contributors
-
-//! 单节点操作追踪与回复缓存。
-
+//! Core state, time, TX authorization and RX cache.
 use crate::protocol::{self, Command, EncodedFrame, FrameRef, Message, NodeId, Query, Response};
+use core::ptr;
 
-/// 单调时钟域中的不透明操作标识。
-///
-/// 此值只在创建它的同一 [`Driver`] 实例内有效；不得跨 driver、重建后的 driver 或设备
-/// 会话保存后复用。
+/// A microsecond timestamp in one monotonic clock domain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct OperationId(u64);
-
-impl OperationId {
-    /// 返回仅用于日志和报告关联的数值。
-    pub const fn get(self) -> u64 {
+pub struct Instant(u64);
+impl Instant {
+    /** Builds a timestamp from microseconds. */
+    pub const fn from_micros(v: u64) -> Self {
+        Self(v)
+    }
+    /** Returns microseconds. */
+    pub const fn as_micros(self) -> u64 {
+        self.0
+    }
+    /** Computes non-negative elapsed time. */
+    pub const fn duration_since(self, before: Self) -> Option<Duration> {
+        match self.0.checked_sub(before.0) {
+            Some(v) => Some(Duration(v)),
+            None => None,
+        }
+    }
+}
+/// A microsecond duration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Duration(u64);
+impl Duration {
+    /** Builds a duration from microseconds. */
+    pub const fn from_micros(v: u64) -> Self {
+        Self(v)
+    }
+    /** Returns microseconds. */
+    pub const fn as_micros(self) -> u64 {
         self.0
     }
 }
 
-/// 已准备操作的协议方向。
+/// Linear identity owned by the application for the lifetime of its driver.
+///
+/// One session is exclusively leased by a driver and all identities it creates. An old permit
+/// cannot be carried into a reconstructed driver, even after dropping the original driver:
+///
+/// ```compile_fail
+/// use odrive_can_driver::{Driver, Instant, Session, protocol::{Command, NodeId}};
+/// let mut session = Session::new();
+/// let node = NodeId::new(1).unwrap();
+/// let mut first = Driver::new(&mut session, node);
+/// let permit = first.prepare_command(Command::ClearErrors,
+///     Instant::from_micros(1), Instant::from_micros(100)).unwrap();
+/// drop(first);
+/// let mut replacement = Driver::new(&mut session, node);
+/// replacement.begin_send(permit, Instant::from_micros(2)).unwrap();
+/// ```
+#[derive(Debug)]
+pub struct Session {
+    _identity: u8,
+}
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Session {
+    /** Creates a session. */
+    pub const fn new() -> Self {
+        Self { _identity: 0 }
+    }
+}
+/// A session-bound operation identity.
+#[derive(Clone, Copy, Debug)]
+pub struct OperationId<'s> {
+    session: &'s Session,
+    sequence: u64,
+}
+impl PartialEq for OperationId<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.sequence == other.sequence && ptr::eq(self.session, other.session)
+    }
+}
+impl Eq for OperationId<'_> {}
+impl OperationId<'_> {
+    /** Returns the session-local log sequence. */
+    pub const fn get(self) -> u64 {
+        self.sequence
+    }
+}
+/// The direction and payload of a local operation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum OperationKind {
-    /// 主机写入命令。
+    /** A host command. */
     Command(Command),
-    /// 主机 RTR 查询。
+    /** An RTR query. */
     Query(Query),
 }
-
-/// 操作当前或最终的本地状态。
+/// Local operation state; `Submitted` is never device acknowledgement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperationState {
-    /// 已编码，但尚未交给收发后端。
+    /// Encoded; no native attempt is active.
     Prepared,
-    /// `SendAttempt` 正在借用 driver；其析构前无法创建另一操作。
+    /// An independent TX attempt is unresolved.
     Dispatching,
-    /// 本地收发后端已接受帧。写命令到此终态；查询仍等待回复或超时。
+    /// Locally accepted; terminal for commands, waiting for queries.
     Submitted,
-    /// 提交后的匹配回复已被观察到。
+    /// The application accepted a matching response.
     Observed,
-    /// 收发后端明确报告该次尝试失败。
+    /// The application explicitly ended the query by rejecting a response.
+    Rejected,
+    /// A backend proved no submission, or preparation for I/O failed.
     Failed,
-    /// 在期限内没有得到所需的本地进展或查询回复。
-    ///
-    /// `submitted_at_ms == None` 表示后端确定没有接受该帧；`Some(_)` 表示查询曾在本地
-    /// 提交但未及时观察到回复。发送结果不确定时使用 [`OperationState::Unknown`]。
+    /// The deadline expired; inspect submitted_at for existing submission.
     TimedOut,
-    /// 尚未发送的操作被调用方取消。
+    /// Cancellation completed; submitted_at distinguishes a submitted query from unsent work.
     Cancelled,
-    /// 发送可能已经发生，但 driver 无法证明最终收发结果。
+    /// A side effect may have occurred; explicit acknowledgement is required to free the slot.
     Unknown,
 }
-
-/// 单一操作的可复制快照。
-///
-/// `Submitted` 是本地队列接受结果，不是设备 ACK。`Observed` 只表示在提交后观察到
-/// 同节点、同回复类型的帧；CANSimple 没有线上请求 ID，因此它也不是因果 ACK。
+/// A snapshot with event times and separately recorded processing time.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct OperationReport {
-    /// 操作标识。
-    pub id: OperationId,
-    /// 操作的协议方向和内容。
+pub struct OperationReport<'s> {
+    /** Operation identity. */
+    pub id: OperationId<'s>,
+    /** Protocol direction. */
     pub kind: OperationKind,
-    /// 调用方提供的独立传输期限，使用与 `now_ms` 相同的单调时钟。
-    pub deadline_ms: u64,
-    /// 成功准备帧的时刻。
-    pub prepared_at_ms: u64,
-    /// 最近一次开始发送尝试的时刻；此值不表示后端已经接受该帧。
-    pub dispatching_at_ms: Option<u64>,
-    /// 已知本地后端接受帧的时刻。
-    pub submitted_at_ms: Option<u64>,
-    /// 终态被记录的时刻；已知未发送但回调时间回退时使用最后已知的单调时刻。
-    pub terminal_at_ms: Option<u64>,
-    /// 当前或最终的操作状态。
+    /** Absolute deadline. */
+    pub deadline: Instant,
+    /** Preparation event time. */
+    pub prepared_at: Instant,
+    /** Most recent dispatch processing time. */
+    pub dispatching_at: Option<Instant>,
+    /** Local submit event time. */
+    pub submitted_at: Option<Instant>,
+    /// Last TX completion event, including a proven unsubmitted result.
+    pub tx_event_at: Option<Instant>,
+    /// Time of the application's cancellation request; submission may have won the race.
+    pub cancel_requested_at: Option<Instant>,
+    /// Terminal event time (deadline, accepted RX, cancellation, or TX event).
+    pub terminal_at: Option<Instant>,
+    /** Last core processing time, which never moves backwards. */
+    pub processed_at: Instant,
+    /** Current state. */
     pub state: OperationState,
-    /// `Observed` 查询的帧内容。
-    pub response: Option<Response>,
+    /** Accepted or explicitly rejected response; unrelated cache entries are not copied here. */
+    pub response: Option<CachedResponse>,
 }
-
-/// 准备操作时的错误。
+/// Preparation failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrepareError {
-    /// 上一个 `Unknown` 或未完成操作仍占用唯一槽位。
+    /// An operation or untaken report occupies the sole slot.
     Busy,
-    /// `now_ms` 已达到或超过期限，不能建立可发送操作。
+    /// The absolute deadline is no later than preparation.
     DeadlineElapsed {
-        /// 调用方的当前时刻。
-        now_ms: u64,
-        /// 调用方的期限。
-        deadline_ms: u64,
+        /// Preparation time.
+        now: Instant,
+        /// Exclusive absolute deadline.
+        deadline: Instant,
     },
-    /// 调用方的本地时钟回退。
+    /// The processing clock moved backwards.
     ClockRollback {
-        /// 上次成功提交给 driver 的本地时刻。
-        previous_ms: u64,
-        /// 本次调用的时刻。
-        now_ms: u64,
+        /// Last accepted processing time.
+        previous: Instant,
+        /// Rejected processing time.
+        now: Instant,
     },
-    /// 协议编码拒绝输入，例如 NaN 或无穷浮点。
+    /// The protocol rejected the payload.
     Encode(protocol::EncodeError),
-    /// 不透明标识空间已经耗尽。
+    /// Operation identity space is exhausted; identities never wrap.
     IdExhausted,
 }
-
-/// 开始发送时的错误。
+/// Cannot consume a permit to start TX.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BeginSendError {
-    /// 标识不属于当前活动操作。
-    StaleOperation,
-    /// 操作不再处于 `Prepared`。
+    /// The permit belongs to another session or an old operation.
+    StalePermit,
+    /// The operation is no longer prepared.
     NotPrepared(OperationState),
-    /// 调用方的本地时钟回退。
+    /// Clock rollback; the consumed permit becomes an unsent Failed report.
     ClockRollback {
-        /// 上次成功提交给 driver 的本地时刻。
-        previous_ms: u64,
-        /// 本次调用的时刻。
-        now_ms: u64,
+        /// Last accepted processing time.
+        previous: Instant,
+        /// Rejected processing time.
+        now: Instant,
     },
-    /// 尚未调用后端前期限已到；操作已成为 `TimedOut` 报告。
+    /// The deadline elapsed before I/O; a TimedOut report is available.
     DeadlineElapsed,
 }
-
-/// 结束一个发送尝试时的错误。
+/// TX authorization or backfill failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttemptError {
-    /// 回调时钟回退；已提交为 `Unknown`，明确未送为 `Failed`，会阻塞则保持 `Prepared`。
-    ClockRollback,
-    /// 回调达到期限；已提交为 `Unknown`，明确未送为 `Failed`，会阻塞则为 `TimedOut`。
-    DeadlineElapsed,
+    /// Another session, operation or attempt owns this identity.
+    StaleAttempt,
+    /// Do not poll native TX again.
+    Revoked(OperationState),
+    /// The result clock regressed; known submission and monotonic report time are retained.
+    ClockRollback {
+        /// Last accepted processing time.
+        previous: Instant,
+        /// Rejected processing time.
+        now: Instant,
+    },
+    /// A proven submission occurred at or after the deadline; submission evidence is retained.
+    EventAfterDeadline,
+    /// The supplied TX event precedes dispatch or is later than result processing.
+    InvalidEventTime,
 }
-
-/// 查询或提取报告时的错误。
+/// Report access failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReportError {
-    /// 标识已被更新的报告淘汰，或从未属于此 driver。
+    /// The identity or candidate is foreign, stale, or already taken.
     StaleOperation,
-    /// 操作仍未到可提取的终态。
+    /// The operation has not reached a takeable terminal state.
     Pending,
-    /// `Unknown` 必须先由调用方确认底层没有待发或迟到发送，再提取报告。
+    /// The caller must first resolve possible late TX and acknowledge uncertainty.
     UnknownPending,
+    /// Result processing uses a clock earlier than the last processing call.
+    ClockRollback {
+        /// Last processing time.
+        previous: Instant,
+        /// Supplied processing time.
+        now: Instant,
+    },
+    /// A receive event cannot be accepted before it has occurred in the shared clock domain.
+    FutureResponse,
 }
-
-/// 输入帧的分类结果。
+/// Decoding result, while caller retains its complete native frame/error.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum IngestResult {
-    /// 帧属于其他节点或当前协议版本未知的命令号。
+    /// Different node or unsupported command number.
     Unrelated,
-    /// 成功解码的同节点协议消息。
+    /// Decoded message; responses update cache but require explicit query admission.
     Message(Message),
-    /// 帧 ID、种类或长度不符合当前协议版本。
+    /// Malformed or unsupported frame; the original native frame stays caller-owned.
     DecodeError(protocol::DecodeError),
 }
-
-/// 回复在固定缓存中的类别。
+/// Fixed cache category.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResponseKind {
-    /// 周期性心跳。
+    /// Periodic heartbeat.
     Heartbeat,
-    /// 电机错误位图。
+    /// Motor error bits.
     MotorError,
-    /// 编码器错误位图。
+    /// Encoder error bits.
     EncoderError,
-    /// 无感估算器错误位图。
+    /// Sensorless error bits.
     SensorlessError,
-    /// 编码器位置和速度。
+    /// Encoder position and velocity.
     EncoderEstimates,
-    /// 编码器计数。
+    /// Encoder counts.
     EncoderCount,
-    /// q 轴电流。
+    /// Setpoint and measured q-axis current.
     Iq,
-    /// 无感估算位置和速度。
+    /// Sensorless position and velocity.
     SensorlessEstimates,
-    /// 母线电压。
+    /// DC bus voltage.
     VbusVoltage,
 }
-
 impl ResponseKind {
-    const fn index(self) -> usize {
+    fn ix(self) -> usize {
         match self {
             Self::Heartbeat => 0,
             Self::MotorError => 1,
@@ -188,9 +269,8 @@ impl ResponseKind {
             Self::VbusVoltage => 8,
         }
     }
-
-    fn from_response(response: Response) -> Self {
-        match response {
+    fn of(r: Response) -> Self {
+        match r {
             Response::Heartbeat { .. } => Self::Heartbeat,
             Response::MotorError(_) => Self::MotorError,
             Response::EncoderError(_) => Self::EncoderError,
@@ -203,536 +283,702 @@ impl ResponseKind {
         }
     }
 }
-
-/// 带接收时间戳的缓存回复。
+/// A decoded response and the application-supplied receive timestamp.
+///
+/// This may be a mapped native timestamp or a dequeue observation; it does not prove device freshness.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CachedResponse {
-    /// 解码后的完整回复；错误位和未知轴状态按协议层原样保留。
+    /** Decoded response. */
     pub response: Response,
-    /// CAN 接收路径提供的时间戳。
-    pub received_at_ms: u64,
+    /** Receive event timestamp. */
+    pub received_at: Instant,
 }
-
-/// 每种协议回复各一项的无分配缓存。
+/// One most-recent response per protocol type.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ResponseCache {
     entries: [Option<CachedResponse>; 9],
 }
-
 impl ResponseCache {
-    /// 返回一种回复的最新条目。
-    pub fn get(&self, kind: ResponseKind) -> Option<CachedResponse> {
-        self.entries[kind.index()]
+    /** Gets cached response. */
+    pub fn get(&self, k: ResponseKind) -> Option<CachedResponse> {
+        self.entries[k.ix()]
     }
-
-    /// 返回心跳的年龄；若 `now_ms` 早于其接收时间戳则返回 `None`。
-    ///
-    /// 此方法不更新 driver 的操作时钟。`now_ms` 必须与接收时间戳使用同一单调时钟域。
-    pub fn heartbeat_age_ms(&self, now_ms: u64) -> Option<u64> {
+    /** Gets heartbeat age. */
+    pub fn heartbeat_age(&self, n: Instant) -> Option<Duration> {
         self.get(ResponseKind::Heartbeat)
-            .and_then(|entry| now_ms.checked_sub(entry.received_at_ms))
+            .and_then(|x| n.duration_since(x.received_at))
     }
-
-    /// 返回是否存在年龄不超过 `max_age_ms` 的心跳。
-    pub fn heartbeat_is_fresh(&self, now_ms: u64, max_age_ms: u64) -> bool {
-        matches!(self.heartbeat_age_ms(now_ms), Some(age) if age <= max_age_ms)
+    /** Tests heartbeat freshness. */
+    pub fn heartbeat_is_fresh(&self, n: Instant, max: Duration) -> bool {
+        matches!(self.heartbeat_age(n),Some(v) if v<=max)
     }
-
-    fn update(&mut self, response: Response, received_at_ms: u64) {
-        let index = ResponseKind::from_response(response).index();
-        if self.entries[index].is_none_or(|cached| cached.received_at_ms <= received_at_ms) {
-            self.entries[index] = Some(CachedResponse {
-                response,
-                received_at_ms,
-            });
+    fn put(&mut self, r: Response, t: Instant) {
+        let i = ResponseKind::of(r).ix();
+        if self.entries[i].is_none_or(|x| x.received_at <= t) {
+            self.entries[i] = Some(CachedResponse {
+                response: r,
+                received_at: t,
+            })
         }
     }
 }
-
-struct ActiveOperation {
-    report: OperationReport,
-    frame: EncodedFrame,
+/// Non-copy single-use permission to initiate one TX attempt.
+#[derive(Debug)]
+#[must_use]
+pub struct SendPermit<'s> {
+    id: OperationId<'s>,
 }
-
-/// 一个 ODrive 节点的单槽 CANSimple driver。
+impl<'s> SendPermit<'s> {
+    /** Gets owning operation. */
+    pub const fn id(&self) -> OperationId<'s> {
+        self.id
+    }
+}
+/// Non-copy native TX attempt; its frame is only available through the per-poll gate.
+#[derive(Debug)]
+#[must_use]
+pub struct TxAttempt<'s> {
+    id: OperationId<'s>,
+    sequence: u64,
+}
+impl<'s> TxAttempt<'s> {
+    /** Gets owning operation. */
+    pub const fn id(&self) -> OperationId<'s> {
+        self.id
+    }
+}
+/// Result supplied only after native TX future has ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxOutcome {
+    /// Known local acceptance; not an ODrive acknowledgement.
+    Submitted {
+        /// Time the native result was observed in the shared monotonic clock domain.
+        occurred_at: Instant,
+    },
+    /// The ended attempt provably did not enqueue; the caller may retry only with the returned permit.
+    WouldBlock {
+        /// Time the native result was observed in the shared monotonic clock domain.
+        occurred_at: Instant,
+    },
+    /// The ended attempt provably did not enqueue and failed.
+    NotSubmitted {
+        /// Time the native result was observed in the shared monotonic clock domain.
+        occurred_at: Instant,
+    },
+}
+/// Next local step after final TX future result.
+#[derive(Debug)]
+pub enum TxCompletion<'s> {
+    /// Submission evidence was recorded; consult the operation report for query/cancellation state.
+    Submitted,
+    /// A new single-use permit after proof of no enqueue; no automatic retry is performed.
+    Retry(SendPermit<'s>),
+    /// No retry permit is returned; inspect the terminal report.
+    Failed,
+}
+/// A particular cached query response presented to application policy.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResponseCandidate<'s> {
+    id: OperationId<'s>,
+    sequence: u64,
+    response: CachedResponse,
+}
+impl ResponseCandidate<'_> {
+    /** Gets cached response. */
+    pub const fn response(self) -> CachedResponse {
+        self.response
+    }
+}
+struct Active<'s> {
+    report: OperationReport<'s>,
+    frame: EncodedFrame,
+    attempt: u64,
+    unknown_acknowledged: bool,
+    candidate_sequence: u64,
+    candidate: Option<ResponseCandidate<'s>>,
+}
+/// One-slot node driver with no CAN controller, allocator, lock or executor.
 ///
-/// `now_ms`、`deadline_ms` 和接收时间戳必须来自同一不回退单调时钟。`ingest` 不推进也不
-/// 回退检查操作时钟，因此硬件 RX 时间早于随后处理它的循环 `now_ms` 仍是合法样本。
-pub struct Driver {
+/// The exclusive Session borrow remains live through every permit, attempt and operation ID.
+/// Native I/O is polled outside the driver, after a short [`Self::authorize_tx`] call.
+/// All timestamps share one monotonic microsecond domain. Event times may precede processing.
+pub struct Driver<'s> {
+    session: &'s Session,
     node: NodeId,
     next_id: u64,
-    last_now_ms: Option<u64>,
-    active: Option<ActiveOperation>,
-    completed: Option<OperationReport>,
+    last: Option<Instant>,
+    active: Option<Active<'s>>,
     cache: ResponseCache,
 }
-
-impl Driver {
-    /// 为一个已验证的 ODrive 节点创建 driver。
-    pub const fn new(node: NodeId) -> Self {
+impl<'s> Driver<'s> {
+    /// Exclusively leases a session. It cannot be rebuilt while any old identity remains usable.
+    pub const fn new(session: &'s mut Session, node: NodeId) -> Self {
         Self {
+            session,
             node,
             next_id: 0,
-            last_now_ms: None,
+            last: None,
             active: None,
-            completed: None,
             cache: ResponseCache { entries: [None; 9] },
         }
     }
-
-    /// 返回此 driver 过滤的节点号。
+    /// Returns the node filtered by the protocol decoder.
     pub const fn node(&self) -> NodeId {
         self.node
     }
-
-    /// 返回只读的九类回复缓存。
+    /// Returns latest response values independently of query completion.
     pub const fn cache(&self) -> &ResponseCache {
         &self.cache
     }
-
-    /// 准备一个写命令，不发送帧也不借用传输后端。
+    /// Encodes a command without I/O. The deadline is an exclusive absolute timestamp.
     ///
-    /// 时间或编码无效会在分配操作 ID 前返回，因此不会占用 ID 或改变活动操作。
+    /// Actually sending an addressed command feeds the supported firmware's watchdog.
+    /// Local submission is not device execution or acknowledgement.
     pub fn prepare_command(
         &mut self,
         command: Command,
-        now_ms: u64,
-        deadline_ms: u64,
-    ) -> Result<OperationId, PrepareError> {
-        self.prepare(OperationKind::Command(command), now_ms, deadline_ms)
+        now: Instant,
+        deadline: Instant,
+    ) -> Result<SendPermit<'s>, PrepareError> {
+        self.prepare(OperationKind::Command(command), now, deadline)
     }
-
-    /// 准备一个 RTR 查询，不发送帧也不借用传输后端。
+    /// Encodes an RTR query without I/O. Sending it also feeds the device watchdog.
     pub fn prepare_query(
         &mut self,
         query: Query,
-        now_ms: u64,
-        deadline_ms: u64,
-    ) -> Result<OperationId, PrepareError> {
-        self.prepare(OperationKind::Query(query), now_ms, deadline_ms)
+        now: Instant,
+        deadline: Instant,
+    ) -> Result<SendPermit<'s>, PrepareError> {
+        self.prepare(OperationKind::Query(query), now, deadline)
     }
-
-    /// 将一个已准备操作转换为独占 `SendAttempt`。
+    /// Consumes the one-use permit. No native I/O has occurred on an error.
     ///
-    /// 只有拥有该 guard 才能读取编码帧和提交收发结果。guard 未以结果方法结束时会把操作
-    /// 标记为 `Unknown`，防止取消 future 或不确定的驱动错误被误认为未发送。
+    /// A consumed permit rejected for rollback leaves a retrievable `Failed` report.
     pub fn begin_send(
         &mut self,
-        id: OperationId,
-        now_ms: u64,
-    ) -> Result<SendAttempt<'_>, BeginSendError> {
-        let Some(active) = self.active.as_ref() else {
-            return Err(BeginSendError::StaleOperation);
-        };
-        if active.report.id != id {
-            return Err(BeginSendError::StaleOperation);
+        permit: SendPermit<'s>,
+        at: Instant,
+    ) -> Result<TxAttempt<'s>, BeginSendError> {
+        if !self.owns(permit.id) {
+            return Err(BeginSendError::StalePermit);
         }
+        let active = self
+            .active
+            .as_ref()
+            .filter(|x| x.report.id == permit.id)
+            .ok_or(BeginSendError::StalePermit)?;
         if active.report.state != OperationState::Prepared {
             return Err(BeginSendError::NotPrepared(active.report.state));
         }
-        if let Some(previous_ms) = self.clock_rollback(now_ms) {
-            return Err(BeginSendError::ClockRollback {
-                previous_ms,
-                now_ms,
-            });
+        if let Err((previous, now)) = self.time(at) {
+            self.finish(OperationState::Failed, previous, previous, None);
+            return Err(BeginSendError::ClockRollback { previous, now });
         }
-        if now_ms >= active.report.deadline_ms {
-            self.commit_clock(now_ms);
-            self.finish_active(OperationState::TimedOut, now_ms, None);
+        if at >= self.active.as_ref().unwrap().report.deadline {
+            let deadline = self.active.as_ref().unwrap().report.deadline;
+            self.finish(OperationState::TimedOut, deadline, at, None);
             return Err(BeginSendError::DeadlineElapsed);
         }
-
-        self.commit_clock(now_ms);
-        let active = self
-            .active
-            .as_mut()
-            .expect("active operation checked above");
+        let active = self.active.as_mut().unwrap();
+        let Some(sequence) = active.attempt.checked_add(1) else {
+            self.finish(OperationState::Failed, at, at, None);
+            return Err(BeginSendError::StalePermit);
+        };
+        active.attempt = sequence;
+        active.candidate = None;
         active.report.state = OperationState::Dispatching;
-        active.report.dispatching_at_ms = Some(now_ms);
-        Ok(SendAttempt {
-            driver: self,
-            id,
-            settled: false,
+        active.report.dispatching_at = Some(at);
+        active.report.processed_at = at;
+        Ok(TxAttempt {
+            id: permit.id,
+            sequence,
         })
     }
-
-    /// 处理一个硬件接收路径借用的帧。
+    /// Authorizes exactly the next native poll; the returned frame is not an independent permit.
     ///
-    /// 每个成功解码的回复更新对应缓存。查询仅在提交后、收到严格早于 deadline 的同类型
-    /// 回复时成为 `Observed`；这是一种观察关联，不能证明回复由该次 RTR 触发。
-    pub fn ingest(&mut self, frame: FrameRef<'_>, received_at_ms: u64) -> IngestResult {
-        let message = match protocol::decode(self.node, frame) {
-            Ok(Some(message)) => message,
-            Ok(None) => return IngestResult::Unrelated,
-            Err(error) => return IngestResult::DecodeError(error),
+    /// A backend MUST call this immediately before EVERY native TX poll, without a suspension
+    /// between authorization and poll. It must not retain the frame for an ungated later send.
+    /// On error, stop/drop the native future. Already queued or independently progressing I/O
+    /// remains unknown; closing this gate does not retract a hardware queue.
+    pub fn authorize_tx(
+        &mut self,
+        attempt: &TxAttempt<'s>,
+        at: Instant,
+    ) -> Result<EncodedFrame, AttemptError> {
+        self.check(attempt)?;
+        if let Err((previous, now)) = self.time(at) {
+            self.mark_unknown(previous);
+            return Err(AttemptError::ClockRollback { previous, now });
+        }
+        let active = self.active.as_mut().unwrap();
+        if at >= active.report.deadline {
+            active.report.state = OperationState::Unknown;
+        }
+        active.report.processed_at = at;
+        if active.report.state != OperationState::Dispatching {
+            return Err(AttemptError::Revoked(active.report.state));
+        }
+        Ok(active.frame)
+    }
+    /// Consumes an ended native attempt and records its event separately from processing time.
+    ///
+    /// `WouldBlock` and `NotSubmitted` require backend proof of no enqueue and no future later
+    /// submission. A late processing call is legal. Invalid event clocks retain actual submission
+    /// evidence but isolate the operation as `Unknown`; no error authorizes an automatic retry.
+    pub fn finish_tx(
+        &mut self,
+        attempt: TxAttempt<'s>,
+        outcome: TxOutcome,
+        at: Instant,
+    ) -> Result<TxCompletion<'s>, AttemptError> {
+        self.check(&attempt)?;
+        let rollback = self.time(at).err();
+        let processed = self.last.unwrap();
+        let event = match outcome {
+            TxOutcome::Submitted { occurred_at }
+            | TxOutcome::WouldBlock { occurred_at }
+            | TxOutcome::NotSubmitted { occurred_at } => occurred_at,
         };
-
+        let active = self.active.as_mut().unwrap();
+        active.report.tx_event_at = Some(event);
+        active.report.processed_at = processed;
+        if matches!(outcome, TxOutcome::Submitted { .. }) {
+            active.report.submitted_at = Some(event);
+        }
+        let invalid = event < active.report.dispatching_at.unwrap() || event > at;
+        let cancelled = active.report.cancel_requested_at;
+        let deadline = active.report.deadline;
+        let submitted = matches!(outcome, TxOutcome::Submitted { .. });
+        if submitted && (invalid || rollback.is_some() || event >= deadline) {
+            self.mark_unknown(processed);
+        } else if submitted {
+            let command = matches!(active.report.kind, OperationKind::Command(_));
+            if command {
+                self.finish(OperationState::Submitted, event, processed, None);
+            } else if let Some(cancelled) = cancelled {
+                self.finish(OperationState::Cancelled, cancelled, processed, None);
+            } else if processed >= deadline {
+                self.finish(OperationState::TimedOut, deadline, processed, None);
+            } else {
+                active.report.state = OperationState::Submitted;
+                active.report.terminal_at = None;
+            }
+        } else if let Some(cancelled) = cancelled {
+            self.finish(OperationState::Cancelled, cancelled, processed, None);
+        } else if processed >= deadline {
+            self.finish(OperationState::TimedOut, deadline, processed, None);
+        } else if invalid || rollback.is_some() || matches!(outcome, TxOutcome::NotSubmitted { .. })
+        {
+            self.finish(OperationState::Failed, event, processed, None);
+        } else {
+            active.report.state = OperationState::Prepared;
+            active.report.terminal_at = None;
+            active.candidate = None;
+        }
+        if let Some((previous, now)) = rollback {
+            return Err(AttemptError::ClockRollback { previous, now });
+        }
+        if invalid {
+            return Err(AttemptError::InvalidEventTime);
+        }
+        if submitted && event >= deadline {
+            return Err(AttemptError::EventAfterDeadline);
+        }
+        if submitted {
+            return Ok(TxCompletion::Submitted);
+        }
+        if self.active.as_ref().unwrap().report.state == OperationState::Prepared {
+            Ok(TxCompletion::Retry(SendPermit { id: attempt.id }))
+        } else {
+            Ok(TxCompletion::Failed)
+        }
+    }
+    /// Records proved cancellation without submission, after the native future has ended.
+    ///
+    /// Only a backend with evidence for this exact attempt may call this. Ordinary cancellation,
+    /// dropping a generic future, or reaching a deadline is not that evidence. A proof after the
+    /// deadline remains valid: the report is `TimedOut`, with no submission, rather than unknown.
+    pub fn cancel_unsubmitted(
+        &mut self,
+        attempt: TxAttempt<'s>,
+        occurred_at: Instant,
+        at: Instant,
+    ) -> Result<(), AttemptError> {
+        self.check(&attempt)?;
+        let rollback = self.time(at).err();
+        let processed = self.last.unwrap();
+        let active = self.active.as_mut().unwrap();
+        active.report.tx_event_at = Some(occurred_at);
+        let invalid = occurred_at < active.report.dispatching_at.unwrap() || occurred_at > at;
+        let deadline = active.report.deadline;
+        let cancelled = active.report.cancel_requested_at;
+        let (state, event) = if let Some(cancelled) = cancelled {
+            (OperationState::Cancelled, cancelled)
+        } else if processed >= deadline {
+            (OperationState::TimedOut, deadline)
+        } else {
+            (OperationState::Cancelled, occurred_at)
+        };
+        self.finish(state, event, processed, None);
+        if let Some((previous, now)) = rollback {
+            Err(AttemptError::ClockRollback { previous, now })
+        } else if invalid {
+            Err(AttemptError::InvalidEventTime)
+        } else {
+            Ok(())
+        }
+    }
+    /// Consumes an ended native future whose submission result is uncertain.
+    ///
+    /// This records `Unknown`, not cancellation. It does not retract queued frames.
+    pub fn abandon_attempt(
+        &mut self,
+        attempt: TxAttempt<'s>,
+        at: Instant,
+    ) -> Result<(), AttemptError> {
+        self.check(&attempt)?;
+        let rollback = self.time(at).err();
+        self.mark_unknown(self.last.unwrap());
+        match rollback {
+            Some((previous, now)) => Err(AttemptError::ClockRollback { previous, now }),
+            None => Ok(()),
+        }
+    }
+    /// Revokes future sends. A live/lost attempt remains unknown until its I/O is resolved.
+    ///
+    /// A prepared operation is provably unsent. Cancelling an already submitted query ends its
+    /// wait and retains `submitted_at`. At equal microsecond values actual submission still wins.
+    pub fn cancel(&mut self, id: OperationId<'s>, at: Instant) -> Result<(), ReportError> {
+        self.report(id)?;
+        self.time(at)
+            .map_err(|(previous, now)| ReportError::ClockRollback { previous, now })?;
+        let active = self.active.as_mut().unwrap();
+        match active.report.state {
+            OperationState::Prepared => {
+                active.report.cancel_requested_at = Some(at);
+                self.finish(OperationState::Cancelled, at, at, None);
+            }
+            OperationState::Dispatching | OperationState::Unknown => {
+                active.report.cancel_requested_at.get_or_insert(at);
+                self.mark_unknown(at);
+            }
+            OperationState::Submitted if matches!(active.report.kind, OperationKind::Query(_)) => {
+                active.report.cancel_requested_at = Some(at);
+                self.finish(OperationState::Cancelled, at, at, None);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    /// Releases unknown isolation only after the application has ended all original TX work
+    /// and dealt with any controller queue which could still emit that frame.
+    ///
+    /// This is an explicit application assertion, NOT proof of non-submission. The returned
+    /// report remains `Unknown`. Subsequent polls with the old attempt fail the gate even if a
+    /// new operation is prepared. Do not use this as permission to retry an unknown side effect.
+    pub fn acknowledge_unknown(
+        &mut self,
+        id: OperationId<'s>,
+    ) -> Result<OperationReport<'s>, ReportError> {
+        let report = self.report(id)?;
+        if report.state != OperationState::Unknown {
+            return Err(ReportError::Pending);
+        }
+        // Keep the terminal report until take_report, but distinguish acknowledged uncertainty.
+        self.active.as_mut().unwrap().unknown_acknowledged = true;
+        Ok(report)
+    }
+    /// Decodes and caches a received frame. No successful decode completes a query by itself.
+    ///
+    /// Native frames/errors remain caller-owned. Timestamp mapping and source continuity are
+    /// application responsibilities. Responses arriving before TX backfill are retained for
+    /// later matching; older frames cannot replace a newer provisional candidate.
+    pub fn ingest(&mut self, frame: FrameRef<'_>, received_at: Instant) -> IngestResult {
+        let message = match protocol::decode(self.node, frame) {
+            Ok(Some(m)) => m,
+            Ok(None) => return IngestResult::Unrelated,
+            Err(e) => return IngestResult::DecodeError(e),
+        };
         if let Message::Response(response) = message {
-            self.cache.update(response, received_at_ms);
-            self.observe_query(response, received_at_ms);
+            self.cache.put(response, received_at);
+            self.candidate(response, received_at);
         }
         IngestResult::Message(message)
     }
-
-    /// 推进操作时钟，并将到期的已准备或已提交查询变为 `TimedOut`。
+    /// Returns the latest eligible candidate after known submission.
     ///
-    /// `Dispatching` 只能在 `SendAttempt` 借用期间存在；该 guard 被取消或遗失会先变为
-    /// `Unknown`，而不是由此方法伪造未发送结论。
-    pub fn tick(&mut self, now_ms: u64) -> Result<(), PrepareError> {
-        if let Some(previous_ms) = self.clock_rollback(now_ms) {
-            return Err(PrepareError::ClockRollback {
-                previous_ms,
-                now_ms,
-            });
+    /// RX must be strictly later than submission and strictly before deadline. Equal microsecond
+    /// timestamps are ambiguous and excluded. Event-time-valid delayed RX/TX may still be accepted
+    /// after tick reports a timeout, until the application takes that report. Cancellation/rejection
+    /// cannot be undone by later feedback. No pre-existing cache is searched to complete a query.
+    pub fn pending_response(
+        &self,
+        id: OperationId<'s>,
+    ) -> Result<Option<ResponseCandidate<'s>>, ReportError> {
+        self.report(id)?;
+        let active = self.active.as_ref().unwrap();
+        Ok(active.candidate.filter(|c| Self::eligible(active, c)))
+    }
+    /// Accepts only the current eligible candidate; caller policy can restrict but never broaden it.
+    pub fn accept_response(
+        &mut self,
+        candidate: ResponseCandidate<'s>,
+        at: Instant,
+    ) -> Result<(), ReportError> {
+        self.decide(candidate, at, Some(OperationState::Observed))
+    }
+    /// Discards this candidate while preserving the cache and prior submission.
+    pub fn ignore_response(
+        &mut self,
+        candidate: ResponseCandidate<'s>,
+        at: Instant,
+    ) -> Result<(), ReportError> {
+        self.decide(candidate, at, None)
+    }
+    /// Ends a query as `Rejected`, preserving both the rejected response and submission evidence.
+    pub fn reject_response(
+        &mut self,
+        candidate: ResponseCandidate<'s>,
+        at: Instant,
+    ) -> Result<(), ReportError> {
+        self.decide(candidate, at, Some(OperationState::Rejected))
+    }
+    /// Advances the processing clock and deadline without performing I/O.
+    ///
+    /// An unresolved attempt becomes `Unknown`, closing future polls while retaining its slot.
+    /// A query timeout is event-time tentative until take_report, permitting delayed RX backfill.
+    pub fn tick(&mut self, at: Instant) -> Result<(), PrepareError> {
+        self.time(at)
+            .map_err(|(previous, now)| PrepareError::ClockRollback { previous, now })?;
+        let Some(active) = self.active.as_mut() else {
+            return Ok(());
+        };
+        active.report.processed_at = at;
+        if at < active.report.deadline {
+            return Ok(());
         }
-        self.commit_clock(now_ms);
-        if self.active.as_ref().is_some_and(|active| {
-            now_ms >= active.report.deadline_ms
-                && matches!(
-                    active.report.state,
-                    OperationState::Prepared | OperationState::Submitted
-                )
-        }) {
-            self.finish_active(OperationState::TimedOut, now_ms, None);
+        let deadline = active.report.deadline;
+        match active.report.state {
+            OperationState::Prepared | OperationState::Submitted
+                if !matches!(active.report.kind, OperationKind::Command(_))
+                    || active.report.state == OperationState::Prepared =>
+            {
+                self.finish(OperationState::TimedOut, deadline, at, None);
+            }
+            OperationState::Dispatching => self.mark_unknown(at),
+            _ => {}
         }
         Ok(())
     }
-
-    /// 取消尚未发送的操作。
-    pub fn cancel(&mut self, id: OperationId, now_ms: u64) -> Result<(), BeginSendError> {
-        let Some(active) = self.active.as_ref() else {
-            return Err(BeginSendError::StaleOperation);
-        };
-        if active.report.id != id {
-            return Err(BeginSendError::StaleOperation);
-        }
-        if active.report.state != OperationState::Prepared {
-            return Err(BeginSendError::NotPrepared(active.report.state));
-        }
-        if let Some(previous_ms) = self.clock_rollback(now_ms) {
-            return Err(BeginSendError::ClockRollback {
-                previous_ms,
-                now_ms,
-            });
-        }
-        self.commit_clock(now_ms);
-        self.finish_active(OperationState::Cancelled, now_ms, None);
-        Ok(())
+    /// Reads the current operation, including an untaken terminal report.
+    pub fn report(&self, id: OperationId<'s>) -> Result<OperationReport<'s>, ReportError> {
+        self.active
+            .as_ref()
+            .filter(|x| self.owns(id) && x.report.id == id)
+            .map(|x| x.report)
+            .ok_or(ReportError::StaleOperation)
     }
-
-    /// 返回活动操作或最近完成操作的快照。
-    pub fn report(&self, id: OperationId) -> Result<OperationReport, ReportError> {
-        if let Some(active) = self.active.as_ref().filter(|active| active.report.id == id) {
-            return Ok(active.report);
+    /// Takes a terminal report and releases the sole slot. This finalizes any tentative timeout.
+    pub fn take_report(&mut self, id: OperationId<'s>) -> Result<OperationReport<'s>, ReportError> {
+        let report = self.report(id)?;
+        match report.state {
+            OperationState::Unknown if !self.active.as_ref().unwrap().unknown_acknowledged => {
+                return Err(ReportError::UnknownPending);
+            }
+            OperationState::Dispatching => return Err(ReportError::UnknownPending),
+            OperationState::Prepared => return Err(ReportError::Pending),
+            OperationState::Submitted if matches!(report.kind, OperationKind::Query(_)) => {
+                return Err(ReportError::Pending);
+            }
+            _ => {}
         }
-        if let Some(report) = self.completed.filter(|report| report.id == id) {
-            return Ok(report);
-        }
-        Err(ReportError::StaleOperation)
-    }
-
-    /// 取走最近完成操作的报告。
-    ///
-    /// `Unknown` 保持占用唯一槽位，直到调用方以 [`Driver::acknowledge_unknown`] 确认底层
-    /// 不会再发送此帧。该确认不取消设备端可能已经执行的命令。
-    pub fn take_report(&mut self, id: OperationId) -> Result<OperationReport, ReportError> {
-        if let Some(active) = self.active.as_ref().filter(|active| active.report.id == id) {
-            return match active.report.state {
-                OperationState::Unknown => Err(ReportError::UnknownPending),
-                _ => Err(ReportError::Pending),
-            };
-        }
-        if self.completed.is_some_and(|report| report.id == id) {
-            return Ok(self
-                .completed
-                .take()
-                .expect("completed report checked above"));
-        }
-        Err(ReportError::StaleOperation)
-    }
-
-    /// 确认未知发送已经不可能再由底层提交，并释放唯一槽位。
-    ///
-    /// 调用方必须先确认其 CAN 控制器、future 或队列没有此帧待发，也不会在稍后发送。
-    /// 此方法仅释放本地追踪，绝不声明设备命令已取消或未执行。
-    pub fn acknowledge_unknown(&mut self, id: OperationId) -> Result<OperationReport, ReportError> {
-        let Some(active) = self.active.as_ref() else {
-            return Err(ReportError::StaleOperation);
-        };
-        if active.report.id != id {
-            return Err(ReportError::StaleOperation);
-        }
-        if active.report.state != OperationState::Unknown {
-            return Err(ReportError::Pending);
-        }
-        let report = self
-            .active
-            .take()
-            .expect("active operation checked above")
-            .report;
-        self.completed = Some(report);
+        self.active = None;
         Ok(report)
     }
-
     fn prepare(
         &mut self,
         kind: OperationKind,
-        now_ms: u64,
-        deadline_ms: u64,
-    ) -> Result<OperationId, PrepareError> {
-        if self.active.is_some() || self.completed.is_some() {
+        now: Instant,
+        deadline: Instant,
+    ) -> Result<SendPermit<'s>, PrepareError> {
+        if self.active.is_some() {
             return Err(PrepareError::Busy);
         }
-        if let Some(previous_ms) = self.clock_rollback(now_ms) {
-            return Err(PrepareError::ClockRollback {
-                previous_ms,
-                now_ms,
-            });
+        if let Some(previous) = self.last.filter(|p| now < *p) {
+            return Err(PrepareError::ClockRollback { previous, now });
         }
-        if now_ms >= deadline_ms {
-            return Err(PrepareError::DeadlineElapsed {
-                now_ms,
-                deadline_ms,
-            });
+        if now >= deadline {
+            return Err(PrepareError::DeadlineElapsed { now, deadline });
         }
-        let message = match kind {
-            OperationKind::Command(command) => Message::Command(command),
-            OperationKind::Query(query) => Message::Request(query),
+        let frame = protocol::encode(
+            self.node,
+            match kind {
+                OperationKind::Command(c) => Message::Command(c),
+                OperationKind::Query(q) => Message::Request(q),
+            },
+        )
+        .map_err(PrepareError::Encode)?;
+        let sequence = self.next_id;
+        self.next_id = sequence.checked_add(1).ok_or(PrepareError::IdExhausted)?;
+        self.last = Some(now);
+        let id = OperationId {
+            session: self.session,
+            sequence,
         };
-        let frame = protocol::encode(self.node, message).map_err(PrepareError::Encode)?;
-        let id = OperationId(self.next_id);
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .ok_or(PrepareError::IdExhausted)?;
-        self.commit_clock(now_ms);
-        self.active = Some(ActiveOperation {
+        self.active = Some(Active {
             report: OperationReport {
                 id,
                 kind,
-                deadline_ms,
-                prepared_at_ms: now_ms,
-                dispatching_at_ms: None,
-                submitted_at_ms: None,
-                terminal_at_ms: None,
+                deadline,
+                prepared_at: now,
+                dispatching_at: None,
+                submitted_at: None,
+                tx_event_at: None,
+                cancel_requested_at: None,
+                terminal_at: None,
+                processed_at: now,
                 state: OperationState::Prepared,
                 response: None,
             },
             frame,
+            attempt: 0,
+            candidate_sequence: 0,
+            candidate: None,
+            unknown_acknowledged: false,
         });
-        Ok(id)
+        Ok(SendPermit { id })
     }
-
-    fn observe_query(&mut self, response: Response, received_at_ms: u64) {
-        let Some(active) = self.active.as_ref() else {
+    fn candidate(&mut self, response: Response, received_at: Instant) {
+        let Some(active) = self.active.as_mut() else {
             return;
         };
-        let is_match = matches!(active.report.kind, OperationKind::Query(query) if response_matches(query, response))
-            && active.report.state == OperationState::Submitted
+        if !matches!(active.report.kind, OperationKind::Query(q) if matches_response(q, response))
+            || !matches!(
+                active.report.state,
+                OperationState::Dispatching
+                    | OperationState::Unknown
+                    | OperationState::Submitted
+                    | OperationState::TimedOut
+            )
+            || !active
+                .report
+                .dispatching_at
+                .is_some_and(|t| received_at >= t)
+            || received_at >= active.report.deadline
+            || active
+                .candidate
+                .is_some_and(|c| c.response.received_at > received_at)
+        {
+            return;
+        }
+        let Some(sequence) = active.candidate_sequence.checked_add(1) else {
+            return;
+        };
+        active.candidate_sequence = sequence;
+        active.candidate = Some(ResponseCandidate {
+            id: active.report.id,
+            sequence,
+            response: CachedResponse {
+                response,
+                received_at,
+            },
+        });
+    }
+    fn eligible(active: &Active<'s>, candidate: &ResponseCandidate<'s>) -> bool {
+        matches!(
+            active.report.state,
+            OperationState::Submitted | OperationState::TimedOut
+        ) && active.report.cancel_requested_at.is_none()
             && active
                 .report
-                .submitted_at_ms
-                .is_some_and(|submitted_at_ms| received_at_ms >= submitted_at_ms)
-            && received_at_ms < active.report.deadline_ms;
-        if is_match {
-            self.finish_active(OperationState::Observed, received_at_ms, Some(response));
-        }
+                .submitted_at
+                .is_some_and(|t| candidate.response.received_at > t)
+            && candidate.response.received_at < active.report.deadline
     }
-
-    fn finish_active(
+    fn decide(
+        &mut self,
+        candidate: ResponseCandidate<'s>,
+        at: Instant,
+        decision: Option<OperationState>,
+    ) -> Result<(), ReportError> {
+        self.report(candidate.id)?;
+        let active = self.active.as_ref().unwrap();
+        if !active
+            .candidate
+            .is_some_and(|c| c.id == candidate.id && c.sequence == candidate.sequence)
+            || !Self::eligible(active, &candidate)
+        {
+            return Err(ReportError::StaleOperation);
+        }
+        if candidate.response.received_at > at {
+            return Err(ReportError::FutureResponse);
+        }
+        self.time(at)
+            .map_err(|(previous, now)| ReportError::ClockRollback { previous, now })?;
+        if let Some(state) = decision {
+            self.finish(
+                state,
+                candidate.response.received_at,
+                at,
+                Some(candidate.response),
+            );
+        } else {
+            let active = self.active.as_mut().unwrap();
+            active.candidate = None;
+            active.report.processed_at = at;
+        }
+        Ok(())
+    }
+    fn check(&self, attempt: &TxAttempt<'s>) -> Result<(), AttemptError> {
+        let active = self.active.as_ref().ok_or(AttemptError::StaleAttempt)?;
+        if !self.owns(attempt.id)
+            || active.report.id != attempt.id
+            || active.attempt != attempt.sequence
+        {
+            return Err(AttemptError::StaleAttempt);
+        }
+        if !matches!(
+            active.report.state,
+            OperationState::Dispatching | OperationState::Unknown
+        ) || active.unknown_acknowledged
+        {
+            return Err(AttemptError::Revoked(active.report.state));
+        }
+        Ok(())
+    }
+    fn mark_unknown(&mut self, at: Instant) {
+        let active = self.active.as_mut().unwrap();
+        active.report.state = OperationState::Unknown;
+        active.report.terminal_at = Some(at);
+        active.report.processed_at = at;
+    }
+    fn finish(
         &mut self,
         state: OperationState,
-        terminal_at_ms: u64,
-        response: Option<Response>,
+        event: Instant,
+        processed: Instant,
+        response: Option<CachedResponse>,
     ) {
-        let mut active = self.active.take().expect("active operation must exist");
+        let active = self.active.as_mut().unwrap();
         active.report.state = state;
-        active.report.terminal_at_ms = Some(terminal_at_ms);
+        active.report.terminal_at = Some(event);
+        active.report.processed_at = processed;
         active.report.response = response;
-        self.completed = Some(active.report);
     }
-
-    fn mark_unknown(&mut self, id: OperationId) {
-        let terminal_at_ms = self
-            .active
-            .as_ref()
-            .and_then(|active| active.report.dispatching_at_ms)
-            .unwrap_or(0);
-        self.mark_unknown_at(id, terminal_at_ms);
+    fn owns(&self, id: OperationId<'s>) -> bool {
+        ptr::eq(id.session, self.session)
     }
-
-    fn mark_unknown_at(&mut self, id: OperationId, terminal_at_ms: u64) {
-        if let Some(active) = self.active.as_mut().filter(|active| active.report.id == id) {
-            active.report.state = OperationState::Unknown;
-            active.report.terminal_at_ms = Some(terminal_at_ms);
+    fn time(&mut self, now: Instant) -> Result<(), (Instant, Instant)> {
+        if let Some(previous) = self.last.filter(|p| now < *p) {
+            return Err((previous, now));
         }
-    }
-
-    fn record_submitted(&mut self, id: OperationId, submitted_at_ms: u64) {
-        if let Some(active) = self.active.as_mut().filter(|active| active.report.id == id) {
-            active.report.submitted_at_ms = Some(submitted_at_ms);
-        }
-    }
-
-    fn clock_rollback(&self, now_ms: u64) -> Option<u64> {
-        self.last_now_ms.filter(|previous_ms| now_ms < *previous_ms)
-    }
-
-    fn commit_clock(&mut self, now_ms: u64) {
-        self.last_now_ms = Some(now_ms);
-    }
-}
-
-/// 独占一个已经进入 `Dispatching` 的发送尝试。
-///
-/// 后端应先持有此 guard，再调用控制器发送；已知结果以对应方法结束 guard。对
-/// `embedded-can` 的 `Ok(Some(displaced))`，后端必须先对本 attempt 调用
-/// [`SendAttempt::submitted`]，再把 `displaced` 原样作为结果完整返回。后端不得在这两个
-/// 步骤之间调用可能 panic 的用户 handler，否则已被控制器接受的新帧会错误地遗失为
-/// `Unknown`。无法完整交还 `displaced` 时不得提交此 attempt；让 guard 析构会保守地生成
-/// `Unknown`。
-pub struct SendAttempt<'a> {
-    driver: &'a mut Driver,
-    id: OperationId,
-    settled: bool,
-}
-
-impl SendAttempt<'_> {
-    /// 返回可交给经典 CAN 后端的协议编码帧。
-    pub fn frame(&self) -> &EncodedFrame {
-        &self
-            .driver
-            .active
-            .as_ref()
-            .expect("send attempt owns active operation")
-            .frame
-    }
-
-    /// 记录后端已在本地接受该帧。
-    ///
-    /// 写命令立刻完成为 `Submitted`；查询保持活动状态，等待同类型回复或到期。
-    pub fn submitted(mut self, now_ms: u64) -> Result<(), AttemptError> {
-        if self.driver.clock_rollback(now_ms).is_some() {
-            self.driver.record_submitted(self.id, now_ms);
-            self.driver.mark_unknown_at(self.id, now_ms);
-            self.settled = true;
-            return Err(AttemptError::ClockRollback);
-        }
-        let deadline_ms = self.active_deadline();
-        if now_ms >= deadline_ms {
-            self.driver.commit_clock(now_ms);
-            self.driver.record_submitted(self.id, now_ms);
-            self.driver.mark_unknown_at(self.id, now_ms);
-            self.settled = true;
-            return Err(AttemptError::DeadlineElapsed);
-        }
-        self.driver.commit_clock(now_ms);
-        let command = {
-            let active = self
-                .driver
-                .active
-                .as_mut()
-                .expect("send attempt owns active operation");
-            active.report.state = OperationState::Submitted;
-            active.report.submitted_at_ms = Some(now_ms);
-            matches!(active.report.kind, OperationKind::Command(_))
-        };
-        if command {
-            self.driver
-                .finish_active(OperationState::Submitted, now_ms, None);
-        }
-        self.settled = true;
+        self.last = Some(now);
         Ok(())
     }
-
-    /// 记录收发后端明确未发送且暂时会阻塞。
-    ///
-    /// 期限前操作返回 `Prepared`，调用方可再次调用 [`Driver::begin_send`]。若 `now_ms`
-    /// 回退，该明确未发送事实仍保留为 `Prepared`，但返回时钟诊断且不会回退内部时钟。
-    pub fn would_block(mut self, now_ms: u64) -> Result<(), AttemptError> {
-        self.not_sent_inner(now_ms)
-    }
-
-    /// 记录收发后端明确未发送。
-    ///
-    /// 该次发送尝试终态为 `Failed`；调用方只可在明确的
-    /// [`SendAttempt::would_block`] 后重新开始一次发送尝试。若 `now_ms` 回退，driver 仍
-    /// 保留明确未发送事实并以最后已知单调时刻记录终态，但返回时钟诊断而不会回退内部时钟。
-    pub fn not_sent(mut self, now_ms: u64) -> Result<(), AttemptError> {
-        if self.driver.clock_rollback(now_ms).is_some() {
-            let terminal_at_ms = self
-                .driver
-                .last_now_ms
-                .expect("begin_send committed the clock");
-            self.driver
-                .finish_active(OperationState::Failed, terminal_at_ms, None);
-            self.settled = true;
-            return Err(AttemptError::ClockRollback);
-        }
-        if now_ms >= self.active_deadline() {
-            self.driver.commit_clock(now_ms);
-            self.driver
-                .finish_active(OperationState::Failed, now_ms, None);
-            self.settled = true;
-            return Err(AttemptError::DeadlineElapsed);
-        }
-        self.driver.commit_clock(now_ms);
-        self.driver
-            .finish_active(OperationState::Failed, now_ms, None);
-        self.settled = true;
-        Ok(())
-    }
-
-    fn not_sent_inner(&mut self, now_ms: u64) -> Result<(), AttemptError> {
-        if self.driver.clock_rollback(now_ms).is_some() {
-            let active = self
-                .driver
-                .active
-                .as_mut()
-                .expect("send attempt owns active operation");
-            active.report.state = OperationState::Prepared;
-            self.settled = true;
-            return Err(AttemptError::ClockRollback);
-        }
-        if now_ms >= self.active_deadline() {
-            self.driver.commit_clock(now_ms);
-            self.driver
-                .finish_active(OperationState::TimedOut, now_ms, None);
-            self.settled = true;
-            return Err(AttemptError::DeadlineElapsed);
-        }
-        self.driver.commit_clock(now_ms);
-        let active = self
-            .driver
-            .active
-            .as_mut()
-            .expect("send attempt owns active operation");
-        active.report.state = OperationState::Prepared;
-        self.settled = true;
-        Ok(())
-    }
-
-    fn active_deadline(&self) -> u64 {
-        self.driver
-            .active
-            .as_ref()
-            .expect("send attempt owns active operation")
-            .report
-            .deadline_ms
-    }
 }
-
-impl Drop for SendAttempt<'_> {
-    fn drop(&mut self) {
-        if !self.settled {
-            self.driver.mark_unknown(self.id);
-        }
-    }
-}
-
-fn response_matches(query: Query, response: Response) -> bool {
+fn matches_response(q: Query, r: Response) -> bool {
     matches!(
-        (query, response),
+        (q, r),
         (Query::MotorError, Response::MotorError(_))
             | (Query::EncoderError, Response::EncoderError(_))
             | (Query::SensorlessError, Response::SensorlessError(_))

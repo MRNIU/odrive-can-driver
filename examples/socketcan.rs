@@ -1,27 +1,15 @@
 // Copyright The odrive-can-driver Contributors
-//! Linux SocketCAN 的一次性 ODrive 操作 CLI。
+//! Linux SocketCAN split-endpoint ODrive CLI.
 //!
 //! ```text
-//! socketcan <interface> <node> <operation> [arguments]
-//!
-//! operation:
-//!   heartbeat | state          等待设备自行发送的一帧 Heartbeat；不发送帧
-//!   vbus                       RTR 读取母线电压
-//!   encoder                    RTR 读取编码器位置和速度
-//!   motor-error | encoder-error RTR 读取对应错误位图
-//!   clear-errors               发送 ClearErrors
-//!   idle                       发送 SetAxisRequestedState(Idle)
-//!   velocity <turn/s> [N*m]    发送 SetInputVel；不会自动进入闭环或在退出时归零
+//! socketcan <interface> <node> <heartbeat|vbus|encoder|motor-error|encoder-error|clear-errors|idle|velocity> [velocity_turn_per_s [torque_ff_nm]]
 //! ```
 //!
-//! `heartbeat` 和 `state` 只接收本进程启动后观察到的设备 Heartbeat；CANSimple 中没有主机
-//! Heartbeat 命令。本示例独占其 SocketCAN 描述符，收到无关、FD、RTR 或错误帧时只输出其
-//! 原始分类后继续等待。共享总线应用应保留原始帧并在自己的统一 RX 循环分发，不能并发运行
-//! 本 CLI 消费同一接收队列。
-//!
-//! 写命令输出 `Submitted` 即结束：这只表示 Linux 内核接受帧，并不是 ODrive ACK。RTR 查询
-//! 必须观察到同节点、同回复类型的帧才输出 `Observed`。超时、明确本地失败和 `Unknown` 都以
-//! 非零退出；`Unknown` 可能已发送，绝不能据此自动重试。
+//! The TX and RX sockets are independently owned. This single loop drains one RX frame, advances
+//! deadlines, and advances one short TX syscall without allowing a waiting send to hold `Driver`.
+//! It retains every native RX frame and its `CanTimestamps`; the simple query policy accepts the
+//! first core-eligible response, while a product may ignore or reject it using source-continuity
+//! or old-frame rules.
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -33,13 +21,13 @@ fn main() {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::{
         env, fmt, io, thread,
-        time::{Duration, Instant},
+        time::{Duration, Instant as StdInstant},
     };
 
     use odrive_can_driver::{
-        Driver, IngestResult, OperationId, OperationState, ResponseKind,
+        Driver, Instant, OperationState, ResponseKind, Session, TxCompletion,
         protocol::{AxisState, Command, NodeId, Query},
-        socketcan::{SocketCan, SocketCanReceive, SocketCanSendError},
+        socketcan::{CanRx, CanRxFrame, CanTx, SocketCanTxError},
     };
     use socketcan::{SocketOptions, id::ERR_MASK_ALL};
 
@@ -54,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     fn usage() -> &'static str {
         "usage: socketcan <interface> <node 0..63> \\
-         <heartbeat|state|vbus|encoder|motor-error|encoder-error|clear-errors|idle|velocity> \\
+         <heartbeat|vbus|encoder|motor-error|encoder-error|clear-errors|idle|velocity> \\
          [velocity_turn_per_s [torque_ff_nm]]"
     }
 
@@ -104,145 +92,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(action)
     }
 
-    fn log_receive(received: SocketCanReceive) {
+    fn log_receive(received: CanRxFrame) {
         match received.classification {
-            Ok(IngestResult::Message(message)) => eprintln!("received ODrive message: {message:?}"),
-            Ok(IngestResult::Unrelated) => {
+            Ok(odrive_can_driver::IngestResult::Message(message)) => {
                 eprintln!(
-                    "received unrelated frame on this CLI socket: {:?}",
-                    received.frame
-                )
-            }
-            Ok(IngestResult::DecodeError(error)) => eprintln!(
-                "received frame outside this protocol version: {error:?}; raw={:?}",
-                received.frame
-            ),
-            Err(error) => eprintln!(
-                "SocketCAN error notification: {error}; raw={:?}",
-                received.frame
-            ),
-        }
-    }
-
-    fn receive_or_wait(
-        bus: &SocketCan,
-        driver: &mut Driver,
-        now_ms: impl FnOnce() -> u64,
-    ) -> io::Result<()> {
-        match bus.receive(driver, now_ms) {
-            Ok(received) => {
-                log_receive(received);
-                Ok(())
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(IDLE_WAIT);
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    fn wait_for_heartbeat(
-        bus: &SocketCan,
-        driver: &mut Driver,
-        now_ms: impl Fn() -> u64,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let deadline_ms = now_ms().saturating_add(TIMEOUT.as_millis() as u64);
-        loop {
-            let now = now_ms();
-            if now >= deadline_ms {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out waiting for a new ODrive Heartbeat; no frame was sent",
-                )
-                .into());
-            }
-            receive_or_wait(bus, driver, &now_ms)?;
-            if let Some(entry) = driver
-                .cache()
-                .get(ResponseKind::Heartbeat)
-                .filter(|entry| entry.received_at_ms < deadline_ms)
-            {
-                println!(
-                    "observed Heartbeat at {} ms: {:?}",
-                    entry.received_at_ms, entry.response
+                    "ODrive message at {} us: {message:?}; native={:?}; timestamps={:?}",
+                    received.received_at.as_micros(),
+                    received.frame,
+                    received.timestamps
                 );
-                return Ok(());
             }
-        }
-    }
-
-    fn run_operation(
-        bus: &SocketCan,
-        driver: &mut Driver,
-        id: OperationId,
-        is_query: bool,
-        now_ms: impl Fn() -> u64,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        loop {
-            driver.tick(now_ms()).map_err(core_error)?;
-            match driver.report(id).map_err(core_error)?.state {
-                OperationState::Prepared => match bus.send(driver, id, &now_ms) {
-                    Ok(()) => continue,
-                    Err(SocketCanSendError::Io(error))
-                        if error.kind() == io::ErrorKind::WouldBlock =>
-                    {
-                        thread::sleep(IDLE_WAIT);
-                    }
-                    Err(error) => {
-                        // The report on the next iteration distinguishes Failed from Unknown.
-                        eprintln!("local SocketCAN send result: {error}");
-                        thread::sleep(IDLE_WAIT);
-                    }
-                },
-                OperationState::Submitted if !is_query => {
-                    let report = driver.take_report(id).map_err(core_error)?;
-                    println!(
-                        "locally Submitted {:?} at {:?} ms; this is not an ODrive ACK",
-                        report.kind, report.submitted_at_ms
-                    );
-                    return Ok(());
-                }
-                OperationState::Submitted => receive_or_wait(bus, driver, &now_ms)?,
-                OperationState::Observed => {
-                    let report = driver.take_report(id).map_err(core_error)?;
-                    println!(
-                        "Observed {:?} at {:?} ms: {:?}",
-                        report.kind, report.terminal_at_ms, report.response
-                    );
-                    return Ok(());
-                }
-                OperationState::TimedOut => {
-                    let report = driver.take_report(id).map_err(core_error)?;
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!(
-                            "operation timed out (submitted_at_ms={:?}, deadline_ms={})",
-                            report.submitted_at_ms, report.deadline_ms
-                        ),
-                    )
-                    .into());
-                }
-                OperationState::Unknown => {
-                    let report = driver.report(id).map_err(core_error)?;
-                    return Err(io::Error::other(format!(
-                        "operation result Unknown (dispatching_at_ms={:?}, submitted_at_ms={:?}); do not retry automatically",
-                        report.dispatching_at_ms, report.submitted_at_ms,
-                    ))
-                    .into());
-                }
-                OperationState::Failed | OperationState::Cancelled => {
-                    let report = driver.take_report(id).map_err(core_error)?;
-                    return Err(io::Error::other(format!(
-                        "operation ended locally as {:?}",
-                        report.state
-                    ))
-                    .into());
-                }
-                OperationState::Dispatching => {
-                    unreachable!("the send guard is not retained by this loop")
-                }
+            Ok(odrive_can_driver::IngestResult::Unrelated) => {
+                eprintln!(
+                    "unrelated native SocketCAN frame={:?}; timestamps={:?}",
+                    received.frame, received.timestamps
+                );
             }
+            Ok(odrive_can_driver::IngestResult::DecodeError(error)) => {
+                eprintln!(
+                    "unsupported ODrive frame ({error:?}); native={:?}; timestamps={:?}",
+                    received.frame, received.timestamps
+                );
+            }
+            Err(error) => eprintln!(
+                "SocketCAN error notification ({error}); native={:?}; timestamps={:?}",
+                received.frame, received.timestamps
+            ),
         }
     }
 
@@ -253,34 +128,149 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node = NodeId::new(node_raw.parse()?).map_err(core_error)?;
     let action = parse_action(operation, &mut arguments)?;
 
-    let started = Instant::now();
-    let now_ms = || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let bus = SocketCan::open(&interface)?;
-    // 只修改本 CLI 描述符，使内核错误帧能走到上面的异常处理分支。
-    bus.socket().set_error_filter(ERR_MASK_ALL)?;
-    let mut driver = Driver::new(node);
+    let started = StdInstant::now();
+    let now =
+        || Instant::from_micros(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+    let tx = CanTx::open(&interface)?;
+    let rx = CanRx::open(&interface)?;
+    // These options apply only to this RX descriptor, never to the shared interface.
+    rx.socket().set_error_filter(ERR_MASK_ALL)?;
+    rx.socket().set_recv_timestamp(true)?;
+    let mut session = Session::new();
+    let mut driver = Driver::new(&mut session, node);
 
-    match action {
-        Action::Heartbeat => wait_for_heartbeat(&bus, &mut driver, now_ms),
-        Action::Query(query) => {
-            let id = driver
-                .prepare_query(
-                    query,
-                    now_ms(),
-                    now_ms().saturating_add(TIMEOUT.as_millis() as u64),
-                )
-                .map_err(core_error)?;
-            run_operation(&bus, &mut driver, id, true, now_ms)
+    if matches!(action, Action::Heartbeat) {
+        let deadline = Instant::from_micros(
+            now()
+                .as_micros()
+                .saturating_add(u64::try_from(TIMEOUT.as_micros()).unwrap_or(u64::MAX)),
+        );
+        loop {
+            if now() >= deadline {
+                return Err(
+                    io::Error::new(io::ErrorKind::TimedOut, "no new ODrive Heartbeat").into(),
+                );
+            }
+            match rx.receive(&mut driver, |_| now()) {
+                Ok(received) => log_receive(received),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::sleep(IDLE_WAIT),
+                Err(error) => return Err(error.into()),
+            }
+            if let Some(entry) = driver
+                .cache()
+                .get(ResponseKind::Heartbeat)
+                .filter(|entry| entry.received_at < deadline)
+            {
+                println!(
+                    "observed Heartbeat at {} us: {:?}",
+                    entry.received_at.as_micros(),
+                    entry.response
+                );
+                return Ok(());
+            }
         }
-        Action::Command(command) => {
-            let id = driver
-                .prepare_command(
-                    command,
-                    now_ms(),
-                    now_ms().saturating_add(TIMEOUT.as_millis() as u64),
-                )
+    }
+
+    let deadline = Instant::from_micros(
+        now()
+            .as_micros()
+            .saturating_add(u64::try_from(TIMEOUT.as_micros()).unwrap_or(u64::MAX)),
+    );
+    let (permit, is_query) = match action {
+        Action::Query(query) => (
+            driver
+                .prepare_query(query, now(), deadline)
+                .map_err(core_error)?,
+            true,
+        ),
+        Action::Command(command) => (
+            driver
+                .prepare_command(command, now(), deadline)
+                .map_err(core_error)?,
+            false,
+        ),
+        Action::Heartbeat => unreachable!(),
+    };
+    let id = permit.id();
+    let mut sending = Some(tx.attempt(driver.begin_send(permit, now()).map_err(core_error)?));
+
+    loop {
+        driver.tick(now()).map_err(core_error)?;
+
+        if sending.is_some() {
+            let result = sending.as_mut().expect("checked").poll(&mut driver, &now);
+            match result {
+                Ok(TxCompletion::Submitted) => sending = None,
+                Ok(TxCompletion::Retry(permit)) => {
+                    sending =
+                        Some(tx.attempt(driver.begin_send(permit, now()).map_err(core_error)?));
+                }
+                Ok(TxCompletion::Failed) => sending = None,
+                Err(SocketCanTxError::Io(error)) => {
+                    return Err(io::Error::other(format!(
+                        "SocketCAN write is Unknown ({error}); do not retry automatically"
+                    ))
+                    .into());
+                }
+                Err(error) => return Err(io::Error::other(error).into()),
+            }
+        }
+
+        match rx.receive(&mut driver, |_| now()) {
+            Ok(received) => log_receive(received),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        if is_query && let Some(candidate) = driver.pending_response(id).map_err(core_error)? {
+            // This CLI has no source-continuity rule, so it accepts only the core-eligible
+            // candidate. A product can call ignore_response or reject_response here instead.
+            driver
+                .accept_response(candidate, now())
                 .map_err(core_error)?;
-            run_operation(&bus, &mut driver, id, false, now_ms)
+        }
+
+        let report = driver.report(id).map_err(core_error)?;
+        match report.state {
+            OperationState::Submitted if !is_query => {
+                let report = driver.take_report(id).map_err(core_error)?;
+                println!(
+                    "locally Submitted {:?} at {:?} us; this is not an ODrive ACK",
+                    report.kind,
+                    report.submitted_at.map(Instant::as_micros)
+                );
+                return Ok(());
+            }
+            OperationState::Observed | OperationState::Rejected => {
+                let report = driver.take_report(id).map_err(core_error)?;
+                println!(
+                    "query {:?} ended as {:?}; response={:?}",
+                    report.kind, report.state, report.response
+                );
+                return Ok(());
+            }
+            OperationState::TimedOut | OperationState::Failed | OperationState::Cancelled => {
+                let report = driver.take_report(id).map_err(core_error)?;
+                return Err(io::Error::other(format!(
+                    "operation ended as {:?}: {:?}",
+                    report.state, report
+                ))
+                .into());
+            }
+            OperationState::Unknown => {
+                // Every SocketCAN call above has already returned. Discard the old wrapper, then
+                // explicitly release isolation; this never establishes that the command was absent.
+                let _ = sending.take();
+                driver.acknowledge_unknown(id).map_err(core_error)?;
+                let report = driver.take_report(id).map_err(core_error)?;
+                return Err(io::Error::other(format!(
+                    "operation is Unknown ({report:?}); do not retry automatically"
+                ))
+                .into());
+            }
+            OperationState::Prepared | OperationState::Dispatching | OperationState::Submitted => {
+                thread::sleep(IDLE_WAIT);
+            }
         }
     }
 }

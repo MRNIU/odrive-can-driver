@@ -1,135 +1,148 @@
 // Copyright The odrive-can-driver Contributors
-
-//! Shared-core behavior tests.
+//! Core timing and ownership regression tests.
 
 use odrive_can_driver::{
-    Driver, IngestResult, OperationKind, OperationState, PrepareError, ReportError, ResponseKind,
-    protocol::{self, Command, FramePayload, FrameRef, NodeId, Query, Response},
-};
-use std::{
-    future::Future,
-    task::{Context, Poll, Waker},
+    Driver, Instant, OperationState, ResponseKind, Session, TxCompletion, TxOutcome,
+    protocol::{self, Command, NodeId, Query, Response},
 };
 
 fn node() -> NodeId {
     NodeId::new(7).unwrap()
 }
-
+fn at(us: u64) -> Instant {
+    Instant::from_micros(us)
+}
 fn response_frame(response: Response) -> protocol::EncodedFrame {
     protocol::encode(node(), protocol::Message::Response(response)).unwrap()
 }
 
 #[test]
-fn invalid_prepare_rejects_before_encoding_or_consuming_an_id() {
-    let mut driver = Driver::new(node());
-    let invalid = Command::SetInputVel {
-        velocity: f32::NAN,
-        torque_ff: 0.0,
-    };
-
+fn rx_before_delayed_tx_backfill_is_retained_and_explicitly_accepted() {
+    let mut session = Session::new();
+    let mut driver = Driver::new(&mut session, node());
+    let permit = driver
+        .prepare_query(Query::MotorError, at(1), at(100))
+        .unwrap();
+    let id = permit.id();
+    let attempt = driver.begin_send(permit, at(2)).unwrap();
+    let frame = response_frame(Response::MotorError(0x8000_0001));
+    driver.ingest(frame.as_ref(), at(12));
+    assert!(driver.pending_response(id).unwrap().is_none());
     assert!(matches!(
-        driver.prepare_command(invalid, 4, 10),
-        Err(PrepareError::Encode(
-            protocol::EncodeError::NonFinite { .. }
-        ))
-    ));
-    assert!(matches!(
-        driver.prepare_query(Query::MotorError, 10, 10),
-        Err(PrepareError::DeadlineElapsed { .. })
-    ));
-
-    assert_eq!(
         driver
-            .prepare_command(Command::ClearErrors, 4, 10)
-            .unwrap()
-            .get(),
-        0
-    );
+            .finish_tx(
+                attempt,
+                TxOutcome::Submitted {
+                    occurred_at: at(10)
+                },
+                at(20)
+            )
+            .unwrap(),
+        TxCompletion::Submitted
+    ));
+    let candidate = driver.pending_response(id).unwrap().unwrap();
+    driver.accept_response(candidate, at(21)).unwrap();
+    let report = driver.take_report(id).unwrap();
+    assert_eq!(report.state, OperationState::Observed);
+    assert_eq!(report.submitted_at, Some(at(10)));
+    assert_eq!(report.response.unwrap().received_at, at(12));
 }
 
 #[test]
-fn ingest_classifies_unrelated_remote_and_fd_frames() {
-    let mut driver = Driver::new(node());
-    let unrelated = FrameRef {
-        id: protocol::FrameId::Standard((8 << 5) | 3),
-        payload: FramePayload::Data(&[0; 8]),
-    };
-    assert_eq!(driver.ingest(unrelated, 2), IngestResult::Unrelated);
-
-    let request = FrameRef {
-        id: protocol::FrameId::Standard((7 << 5) | 3),
-        payload: FramePayload::Remote { dlc: 8 },
-    };
-    assert_eq!(
-        driver.ingest(request, 3),
-        IngestResult::Message(protocol::Message::Request(Query::MotorError))
-    );
-
-    let fd = FrameRef {
-        id: protocol::FrameId::Standard((7 << 5) | 1),
-        payload: FramePayload::Fd(&[0; 8]),
-    };
-    assert_eq!(
-        driver.ingest(fd, 4),
-        IngestResult::DecodeError(protocol::DecodeError::UnsupportedCanFd)
-    );
+fn same_microsecond_response_is_not_auto_matched() {
+    let mut session = Session::new();
+    let mut driver = Driver::new(&mut session, node());
+    let permit = driver
+        .prepare_query(Query::MotorError, at(1), at(100))
+        .unwrap();
+    let id = permit.id();
+    let attempt = driver.begin_send(permit, at(2)).unwrap();
+    driver.ingest(response_frame(Response::MotorError(1)).as_ref(), at(10));
+    driver
+        .finish_tx(
+            attempt,
+            TxOutcome::Submitted {
+                occurred_at: at(10),
+            },
+            at(11),
+        )
+        .unwrap();
+    assert!(driver.pending_response(id).unwrap().is_none());
 }
 
 #[test]
-fn cache_keeps_newest_heartbeat_and_all_error_bits() {
-    let mut driver = Driver::new(node());
-    let newest = response_frame(Response::Heartbeat {
+fn rejection_ends_query_without_erasing_submission() {
+    let mut session = Session::new();
+    let mut driver = Driver::new(&mut session, node());
+    let permit = driver
+        .prepare_query(Query::VbusVoltage, at(1), at(100))
+        .unwrap();
+    let id = permit.id();
+    let attempt = driver.begin_send(permit, at(2)).unwrap();
+    driver
+        .finish_tx(attempt, TxOutcome::Submitted { occurred_at: at(3) }, at(4))
+        .unwrap();
+    driver.ingest(response_frame(Response::VbusVoltage(48.0)).as_ref(), at(5));
+    driver
+        .reject_response(driver.pending_response(id).unwrap().unwrap(), at(6))
+        .unwrap();
+    let report = driver.take_report(id).unwrap();
+    assert_eq!(report.state, OperationState::Rejected);
+    assert_eq!(report.submitted_at, Some(at(3)));
+}
+
+#[test]
+fn deadline_revokes_gate_but_preserves_unknown_slot() {
+    let mut session = Session::new();
+    let mut driver = Driver::new(&mut session, node());
+    let permit = driver
+        .prepare_command(Command::ClearErrors, at(1), at(10))
+        .unwrap();
+    let id = permit.id();
+    let attempt = driver.begin_send(permit, at(2)).unwrap();
+    driver.tick(at(10)).unwrap();
+    assert_eq!(driver.report(id).unwrap().state, OperationState::Unknown);
+    assert!(driver.authorize_tx(&attempt, at(11)).is_err());
+}
+
+#[test]
+fn cache_preserves_timestamp_and_error_bits() {
+    let mut session = Session::new();
+    let mut driver = Driver::new(&mut session, node());
+    let heartbeat = response_frame(Response::Heartbeat {
         axis_error: 0x8000_0001,
         axis_state: protocol::AxisState::IDLE,
     });
-    let older = response_frame(Response::Heartbeat {
-        axis_error: 0,
-        axis_state: protocol::AxisState::CLOSED_LOOP_CONTROL,
-    });
-
-    driver.ingest(newest.as_ref(), 20);
-    driver.ingest(older.as_ref(), 19);
+    driver.ingest(heartbeat.as_ref(), at(20));
     let cached = driver.cache().get(ResponseKind::Heartbeat).unwrap();
-    assert_eq!(cached.received_at_ms, 20);
+    assert_eq!(cached.received_at, at(20));
     assert_eq!(
         cached.response,
         Response::Heartbeat {
             axis_error: 0x8000_0001,
-            axis_state: protocol::AxisState::IDLE,
+            axis_state: protocol::AxisState::IDLE
         }
     );
-    assert_eq!(driver.cache().heartbeat_age_ms(25), Some(5));
-    assert!(driver.cache().heartbeat_is_fresh(25, 5));
-    assert!(!driver.cache().heartbeat_is_fresh(26, 5));
-    assert_eq!(driver.cache().heartbeat_age_ms(19), None);
+    assert_eq!(driver.cache().heartbeat_age(at(25)).unwrap().as_micros(), 5);
 }
 
 #[test]
-fn would_block_returns_the_operation_to_prepared_for_a_retry() {
-    let mut driver = Driver::new(node());
-    let id = driver.prepare_query(Query::MotorError, 0, 20).unwrap();
-    driver.begin_send(id, 1).unwrap().would_block(2).unwrap();
-    assert_eq!(driver.report(id).unwrap().state, OperationState::Prepared);
-    let attempt = driver.begin_send(id, 3).unwrap();
-    assert!(attempt.frame().is_remote());
-    attempt.not_sent(4).unwrap();
-}
+fn lost_attempt_cancel_is_unknown_until_acknowledged_then_released() {
+    let mut session = Session::new();
+    let mut driver = Driver::new(&mut session, node());
+    let permit = driver
+        .prepare_command(Command::ClearErrors, at(1), at(100))
+        .unwrap();
+    let id = permit.id();
+    drop(driver.begin_send(permit, at(2)).unwrap());
 
-#[test]
-fn dropped_send_guard_is_unknown_and_blocks_the_single_slot_until_acknowledged() {
-    let mut driver = Driver::new(node());
-    let id = driver.prepare_command(Command::ClearErrors, 0, 20).unwrap();
-    {
-        let _attempt = driver.begin_send(id, 1).unwrap();
-    }
+    driver.cancel(id, at(3)).unwrap();
     assert_eq!(driver.report(id).unwrap().state, OperationState::Unknown);
-    assert!(matches!(
-        driver.prepare_command(Command::ClearErrors, 2, 20),
-        Err(PrepareError::Busy)
-    ));
-    assert_eq!(driver.take_report(id), Err(ReportError::UnknownPending));
-    let report = driver.acknowledge_unknown(id).unwrap();
-    assert_eq!(report.state, OperationState::Unknown);
+    assert!(driver.take_report(id).is_err());
+    assert_eq!(
+        driver.acknowledge_unknown(id).unwrap().state,
+        OperationState::Unknown
+    );
     assert_eq!(
         driver.take_report(id).unwrap().state,
         OperationState::Unknown
@@ -137,210 +150,212 @@ fn dropped_send_guard_is_unknown_and_blocks_the_single_slot_until_acknowledged()
 }
 
 #[test]
-fn deadlines_distinguish_never_dispatched_from_submitted_queries() {
-    let mut unsent = Driver::new(node());
-    let unstarted = unsent.prepare_query(Query::MotorError, 0, 10).unwrap();
-    unsent.tick(10).unwrap();
-    let report = unsent.take_report(unstarted).unwrap();
-    assert_eq!(report.state, OperationState::TimedOut);
-    assert_eq!(report.submitted_at_ms, None);
-
-    let mut submitted = Driver::new(node());
-    let id = submitted.prepare_query(Query::MotorError, 0, 10).unwrap();
-    submitted.begin_send(id, 9).unwrap().submitted(9).unwrap();
-    submitted.tick(10).unwrap();
-    let report = submitted.take_report(id).unwrap();
-    assert_eq!(report.state, OperationState::TimedOut);
-    assert_eq!(report.submitted_at_ms, Some(9));
+fn acknowledged_old_attempt_cannot_authorize_after_new_operation() {
+    let mut session = Session::new();
+    let mut driver = Driver::new(&mut session, node());
+    let permit = driver
+        .prepare_command(Command::ClearErrors, at(1), at(100))
+        .unwrap();
+    let id = permit.id();
+    let attempt = driver.begin_send(permit, at(2)).unwrap();
+    driver.cancel(id, at(3)).unwrap();
+    driver.acknowledge_unknown(id).unwrap();
+    driver.take_report(id).unwrap();
+    let next = driver
+        .prepare_command(Command::ClearErrors, at(4), at(100))
+        .unwrap();
+    let next_id = next.id();
+    assert_ne!(id.get(), next_id.get());
+    assert!(driver.authorize_tx(&attempt, at(4)).is_err());
 }
 
 #[test]
-fn submitted_at_deadline_or_with_a_rolled_clock_is_unknown_but_keeps_submission_evidence() {
-    let mut at_deadline = Driver::new(node());
-    let id = at_deadline
-        .prepare_command(Command::ClearErrors, 0, 10)
+fn submitted_at_deadline_is_retained_even_when_operation_is_unknown() {
+    let mut session = Session::new();
+    let mut driver = Driver::new(&mut session, node());
+    let permit = driver
+        .prepare_command(Command::ClearErrors, at(1), at(10))
         .unwrap();
-    assert_eq!(
-        at_deadline.begin_send(id, 9).unwrap().submitted(10),
-        Err(odrive_can_driver::AttemptError::DeadlineElapsed)
+    let id = permit.id();
+    let attempt = driver.begin_send(permit, at(2)).unwrap();
+    assert!(
+        driver
+            .finish_tx(
+                attempt,
+                TxOutcome::Submitted {
+                    occurred_at: at(10)
+                },
+                at(11)
+            )
+            .is_err()
     );
-    let report = at_deadline.report(id).unwrap();
+    let report = driver.report(id).unwrap();
     assert_eq!(report.state, OperationState::Unknown);
-    assert_eq!(report.submitted_at_ms, Some(10));
-    at_deadline.acknowledge_unknown(id).unwrap();
-    at_deadline.take_report(id).unwrap();
-    assert!(matches!(
-        at_deadline.prepare_command(Command::ClearErrors, 9, 20),
-        Err(PrepareError::ClockRollback { .. })
-    ));
-    at_deadline
-        .prepare_command(Command::ClearErrors, 10, 20)
+    assert_eq!(report.submitted_at, Some(at(10)));
+    assert_eq!(report.tx_event_at, Some(at(10)));
+}
+
+#[test]
+fn rollback_keeps_report_processing_time_monotonic_while_retaining_event() {
+    let mut session = Session::new();
+    let mut driver = Driver::new(&mut session, node());
+    let permit = driver
+        .prepare_command(Command::ClearErrors, at(5), at(100))
         .unwrap();
+    let id = permit.id();
+    let attempt = driver.begin_send(permit, at(6)).unwrap();
+    assert!(
+        driver
+            .finish_tx(attempt, TxOutcome::Submitted { occurred_at: at(7) }, at(4))
+            .is_err()
+    );
+    let report = driver.report(id).unwrap();
+    assert_eq!(report.processed_at, at(6));
+    assert_eq!(report.submitted_at, Some(at(7)));
+}
 
-    let mut rollback = Driver::new(node());
-    let rollback_id = rollback
-        .prepare_command(Command::ClearErrors, 5, 20)
+#[test]
+fn would_block_after_cancellation_cannot_reopen_a_retry() {
+    let mut session = Session::new();
+    let mut driver = Driver::new(&mut session, node());
+    let permit = driver
+        .prepare_query(Query::MotorError, at(1), at(100))
         .unwrap();
-    assert_eq!(
-        rollback.begin_send(rollback_id, 6).unwrap().submitted(5),
-        Err(odrive_can_driver::AttemptError::ClockRollback)
-    );
-    let report = rollback.report(rollback_id).unwrap();
-    assert_eq!(report.state, OperationState::Unknown);
-    assert_eq!(report.submitted_at_ms, Some(5));
-}
-
-#[test]
-fn known_not_sent_with_a_rolled_clock_is_failed_at_the_last_known_time() {
-    let mut driver = Driver::new(node());
-    let id = driver.prepare_command(Command::ClearErrors, 5, 20).unwrap();
-    assert_eq!(
-        driver.begin_send(id, 6).unwrap().not_sent(5),
-        Err(odrive_can_driver::AttemptError::ClockRollback)
-    );
-    let report = driver.take_report(id).unwrap();
-    assert_eq!(report.state, OperationState::Failed);
-    assert_eq!(report.terminal_at_ms, Some(6));
-}
-
-#[test]
-fn would_block_with_a_rolled_clock_returns_to_prepared_without_rewinding_time() {
-    let mut driver = Driver::new(node());
-    let id = driver.prepare_query(Query::MotorError, 5, 20).unwrap();
-    assert_eq!(
-        driver.begin_send(id, 6).unwrap().would_block(5),
-        Err(odrive_can_driver::AttemptError::ClockRollback)
-    );
-    assert_eq!(driver.report(id).unwrap().state, OperationState::Prepared);
+    let id = permit.id();
+    let attempt = driver.begin_send(permit, at(2)).unwrap();
+    driver.cancel(id, at(3)).unwrap();
     assert!(matches!(
-        driver.begin_send(id, 5),
-        Err(odrive_can_driver::BeginSendError::ClockRollback { .. })
+        driver
+            .finish_tx(attempt, TxOutcome::WouldBlock { occurred_at: at(4) }, at(4))
+            .unwrap(),
+        TxCompletion::Failed
     ));
-    driver.begin_send(id, 6).unwrap().not_sent(7).unwrap();
-}
-
-#[test]
-fn known_not_sent_at_deadline_is_failed_not_timed_out() {
-    let mut driver = Driver::new(node());
-    let id = driver.prepare_command(Command::ClearErrors, 0, 10).unwrap();
-    assert_eq!(
-        driver.begin_send(id, 9).unwrap().not_sent(10),
-        Err(odrive_can_driver::AttemptError::DeadlineElapsed)
-    );
     assert_eq!(
         driver.take_report(id).unwrap().state,
-        OperationState::Failed
-    );
-}
-
-#[test]
-fn cancel_only_applies_to_prepared_operations() {
-    let mut prepared = Driver::new(node());
-    let id = prepared.prepare_query(Query::MotorError, 0, 10).unwrap();
-    prepared.cancel(id, 1).unwrap();
-    assert_eq!(
-        prepared.take_report(id).unwrap().state,
         OperationState::Cancelled
     );
-
-    let mut submitted = Driver::new(node());
-    let id = submitted.prepare_query(Query::MotorError, 0, 10).unwrap();
-    submitted.begin_send(id, 1).unwrap().submitted(1).unwrap();
-    assert!(matches!(
-        submitted.cancel(id, 2),
-        Err(odrive_can_driver::BeginSendError::NotPrepared(
-            OperationState::Submitted
-        ))
-    ));
 }
 
 #[test]
-fn heartbeat_never_observes_a_submitted_write() {
-    let mut driver = Driver::new(node());
-    let id = driver.prepare_command(Command::ClearErrors, 0, 10).unwrap();
-    driver.begin_send(id, 1).unwrap().submitted(1).unwrap();
-    let heartbeat = response_frame(Response::Heartbeat {
-        axis_error: 0,
-        axis_state: protocol::AxisState::IDLE,
-    });
-    driver.ingest(heartbeat.as_ref(), 2);
-    assert_eq!(driver.report(id).unwrap().state, OperationState::Submitted);
+fn permit_from_another_session_is_rejected() {
+    let mut first_session = Session::new();
+    let mut second_session = Session::new();
+    let mut first = Driver::new(&mut first_session, node());
+    let permit = first
+        .prepare_command(Command::ClearErrors, at(1), at(100))
+        .unwrap();
+    let mut second = Driver::new(&mut second_session, node());
+    assert!(second.begin_send(permit, at(2)).is_err());
 }
 
 #[test]
-fn an_unpolled_send_future_keeps_the_operation_prepared() {
-    let mut driver = Driver::new(node());
-    let id = driver.prepare_command(Command::ClearErrors, 0, 10).unwrap();
-    let future = async {
-        let _attempt = driver.begin_send(id, 1).unwrap();
-        core::future::pending::<()>().await;
-    };
-
-    drop(future);
-    assert_eq!(driver.report(id).unwrap().state, OperationState::Prepared);
+fn ignored_candidate_cannot_be_reused_for_an_identical_new_response() {
+    let mut session = Session::new();
+    let mut driver = Driver::new(&mut session, node());
+    let permit = driver
+        .prepare_query(Query::MotorError, at(1), at(100))
+        .unwrap();
+    let id = permit.id();
+    let attempt = driver.begin_send(permit, at(2)).unwrap();
+    driver
+        .finish_tx(attempt, TxOutcome::Submitted { occurred_at: at(3) }, at(4))
+        .unwrap();
+    let frame = response_frame(Response::MotorError(7));
+    driver.ingest(frame.as_ref(), at(5));
+    let old = driver.pending_response(id).unwrap().unwrap();
+    driver.ignore_response(old, at(6)).unwrap();
+    driver.ingest(frame.as_ref(), at(6));
+    let current = driver.pending_response(id).unwrap().unwrap();
+    assert!(driver.accept_response(old, at(7)).is_err());
+    driver.accept_response(current, at(7)).unwrap();
 }
 
 #[test]
-fn a_polled_send_future_dropped_while_dispatching_is_unknown() {
-    let mut driver = Driver::new(node());
-    let id = driver.prepare_command(Command::ClearErrors, 0, 10).unwrap();
-    {
-        let future = async {
-            let _attempt = driver.begin_send(id, 1).unwrap();
-            core::future::pending::<()>().await;
-        };
-        let mut future = core::pin::pin!(future);
-        let waker = Waker::noop();
-        let mut context = Context::from_waker(waker);
-        assert_eq!(future.as_mut().poll(&mut context), Poll::Pending);
-    }
-    assert_eq!(driver.report(id).unwrap().state, OperationState::Unknown);
+fn timeout_allows_late_processing_of_event_time_valid_response() {
+    let mut session = Session::new();
+    let mut driver = Driver::new(&mut session, node());
+    let permit = driver
+        .prepare_query(Query::MotorError, at(1), at(10))
+        .unwrap();
+    let id = permit.id();
+    let attempt = driver.begin_send(permit, at(2)).unwrap();
+    driver
+        .finish_tx(attempt, TxOutcome::Submitted { occurred_at: at(3) }, at(4))
+        .unwrap();
+    driver.tick(at(10)).unwrap();
+    assert_eq!(driver.report(id).unwrap().state, OperationState::TimedOut);
+    driver.ingest(response_frame(Response::MotorError(9)).as_ref(), at(5));
+    let candidate = driver.pending_response(id).unwrap().unwrap();
+    driver.accept_response(candidate, at(11)).unwrap();
+    assert_eq!(
+        driver.take_report(id).unwrap().state,
+        OperationState::Observed
+    );
 }
 
 #[test]
-fn query_observation_requires_a_matching_response_after_submit_and_before_deadline() {
-    let mut driver = Driver::new(node());
-    let id = driver.prepare_query(Query::MotorError, 0, 20).unwrap();
-    driver.begin_send(id, 10).unwrap().submitted(10).unwrap();
-    let response = response_frame(Response::MotorError(0x4000_0000));
+fn admission_never_uses_old_cache_wrong_node_type_or_deadline_frames() {
+    let mut session = Session::new();
+    let mut driver = Driver::new(&mut session, node());
+    let response = response_frame(Response::MotorError(1));
+    driver.ingest(response.as_ref(), at(4));
+    let permit = driver
+        .prepare_query(Query::MotorError, at(5), at(30))
+        .unwrap();
+    let id = permit.id();
+    let attempt = driver.begin_send(permit, at(6)).unwrap();
+    driver
+        .finish_tx(
+            attempt,
+            TxOutcome::Submitted {
+                occurred_at: at(10),
+            },
+            at(11),
+        )
+        .unwrap();
+    assert!(driver.pending_response(id).unwrap().is_none());
+    let foreign = protocol::encode(
+        NodeId::new(8).unwrap(),
+        protocol::Message::Response(Response::MotorError(2)),
+    )
+    .unwrap();
+    driver.ingest(foreign.as_ref(), at(12));
+    driver.ingest(
+        response_frame(Response::Heartbeat {
+            axis_error: 0,
+            axis_state: protocol::AxisState::IDLE,
+        })
+        .as_ref(),
+        at(13),
+    );
+    driver.ingest(response.as_ref(), at(10));
+    driver.ingest(response.as_ref(), at(30));
+    assert!(driver.pending_response(id).unwrap().is_none());
+    driver.ingest(response_frame(Response::MotorError(3)).as_ref(), at(20));
+    driver.ingest(response.as_ref(), at(9));
+    let candidate = driver.pending_response(id).unwrap().unwrap();
+    assert_eq!(candidate.response().response, Response::MotorError(3));
+    driver.accept_response(candidate, at(21)).unwrap();
+}
 
-    driver.ingest(response.as_ref(), 10);
+#[test]
+fn cancellation_racing_with_same_microsecond_submission_preserves_the_submission() {
+    let mut session = Session::new();
+    let mut driver = Driver::new(&mut session, node());
+    let permit = driver
+        .prepare_command(Command::ClearErrors, at(1), at(30))
+        .unwrap();
+    let id = permit.id();
+    let attempt = driver.begin_send(permit, at(2)).unwrap();
+    driver.authorize_tx(&attempt, at(3)).unwrap();
+    // A native synchronous call completed before cancellation was processed, but both clocks
+    // have the same microsecond value. Its result was backfilled only afterward.
+    driver.cancel(id, at(4)).unwrap();
+    driver
+        .finish_tx(attempt, TxOutcome::Submitted { occurred_at: at(4) }, at(5))
+        .unwrap();
     let report = driver.take_report(id).unwrap();
-    assert_eq!(report.state, OperationState::Observed);
-    assert_eq!(report.response, Some(Response::MotorError(0x4000_0000)));
-
-    let mut late = Driver::new(node());
-    let late_id = late.prepare_query(Query::MotorError, 0, 20).unwrap();
-    late.begin_send(late_id, 10).unwrap().submitted(10).unwrap();
-    late.ingest(response.as_ref(), 20);
-    assert_eq!(
-        late.report(late_id).unwrap().state,
-        OperationState::Submitted
-    );
-    late.tick(20).unwrap();
-    assert_eq!(
-        late.take_report(late_id).unwrap().state,
-        OperationState::TimedOut
-    );
-}
-
-#[test]
-fn completed_report_ids_become_stale_after_a_later_completion() {
-    let mut driver = Driver::new(node());
-    let first = driver.prepare_command(Command::ClearErrors, 0, 10).unwrap();
-    driver.begin_send(first, 1).unwrap().submitted(1).unwrap();
-    assert!(matches!(
-        driver.prepare_command(Command::ClearErrors, 2, 10),
-        Err(PrepareError::Busy)
-    ));
-    assert_eq!(
-        driver.take_report(first).unwrap().state,
-        OperationState::Submitted
-    );
-    let second = driver.prepare_command(Command::ClearErrors, 2, 10).unwrap();
-    driver.begin_send(second, 3).unwrap().submitted(3).unwrap();
-
-    assert_eq!(driver.report(first), Err(ReportError::StaleOperation));
-    let report = driver.take_report(second).unwrap();
-    assert_eq!(report.kind, OperationKind::Command(Command::ClearErrors));
+    assert_eq!(report.state, OperationState::Submitted);
+    assert_eq!(report.submitted_at, Some(at(4)));
+    assert_eq!(report.cancel_requested_at, Some(at(4)));
 }
