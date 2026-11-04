@@ -18,7 +18,7 @@
 
 ```toml
 [dependencies]
-odrive_can_driver = { version = "0.3.0", features = ["embedded-can"] }
+odrive_can_driver = { version = "0.3.1", features = ["embedded-can"] }
 ```
 
 按接入方式选择 feature；只使用协议编解码或共享状态机时可省略 `features`，默认是 `[]`。
@@ -74,7 +74,7 @@ assert_eq!(
 
 ## 从 `odrive-can-protocol` 迁移
 
-`odrive-can-protocol` 的 `0.1.x` 是旧的独立 crate；其实现已内置到本 crate。将 Cargo 依赖改为 `odrive_can_driver = "0.3.0"`，并把导入从 `odrive_can_protocol::...` 改为 `odrive_can_driver::protocol::...`。例如：
+`odrive-can-protocol` 的 `0.1.x` 是旧的独立 crate；其实现已内置到本 crate。将 Cargo 依赖改为 `odrive_can_driver = "0.3.1"`，并把导入从 `odrive_can_protocol::...` 改为 `odrive_can_driver::protocol::...`。例如：
 
 ```rust
 // 旧：use odrive_can_protocol::{encode, Command, NodeId};
@@ -203,7 +203,7 @@ sequenceDiagram
 
 ```toml
 [dependencies]
-odrive_can_driver = { version = "0.3.0", features = ["embedded-can"] }
+odrive_can_driver = { version = "0.3.1", features = ["embedded-can"] }
 embedded-can = "0.4.1"
 ```
 
@@ -238,7 +238,7 @@ sequenceDiagram
 
 ```toml
 [dependencies]
-odrive_can_driver = { version = "0.3.0", features = ["embassy-stm32"] }
+odrive_can_driver = { version = "0.3.1", features = ["embassy-stm32"] }
 embassy-stm32 = { version = "0.6.0", features = ["stm32h723vg"] }
 
 [patch.crates-io]
@@ -246,6 +246,8 @@ embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", rev = "b48dc1b5
 ```
 
 registry `embassy-stm32 0.6.0` 的 RTR DLC 8 发送缺陷由上述修订修复。取消证据同样仅针对这个固定修订的**非缓冲** `CanTx::write`：[`TxMode::write_generic`](https://github.com/embassy-rs/embassy/blob/b48dc1b51d0d788396a04b5d819172ee0b66bd81/embassy-stm32/src/can/fdcan.rs#L1025-L1044) 在一次 poll 内同步调用寄存器发送，入队成功直接 `Ready`，只有 `WouldBlock` 才 `Pending`。[寄存器层的两个 `WouldBlock` 分支](https://github.com/embassy-rs/embassy/blob/b48dc1b51d0d788396a04b5d819172ee0b66bd81/embassy-stm32/src/can/fd/peripheral.rs#L274-L307) 都发生在写入新帧之前；成功置换旧帧则通过 `Ready` 返回该帧。该 future 结束后没有后台重试提交路径。不能将这个结论推广到 buffered CAN、其他 HAL 或其他 Embassy revision。
+
+0.3.1 修复了新版 Embassy 长度检查导致 RTR 查询帧构造 panic 的问题；查询仍为 Classic RTR、DLC 8。从 0.3.0 升级时，应用工作区应同时更新上述 patch 的固定修订。
 
 应用通过 `Can::split` 获取 `CanTx` / `CanRx`。TX 每次 poll 前经过 Driver 门禁；RX 保留完整 `FdEnvelope`，包括 Classic/FD/RTR 标志和原生时间戳。启用 Embassy `time`（通常由应用的 `time-driver-*` 启用）时，`ts` 是 Embassy `Instant`，可用 `as_micros()` 映射；未启用时是原生 16-bit 控制器时间戳，应用须处理其时钟域与回绕，不能直接当作 Driver 绝对时间。TX 等待期间应用照常接收、推进期限及响应取消。示例展示同一个调度循环中的这些步骤；库不另建任务、不加内部锁。
 
