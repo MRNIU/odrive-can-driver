@@ -11,13 +11,24 @@ use crate::protocol::{EncodedFrame, FramePayload, FrameRef};
 impl From<&EncodedFrame> for Frame {
     fn from(frame: &EncodedFrame) -> Self {
         // 编码器保证标准 ID、DLC <= 8 和有效数据长度。
-        Self::new(encoded_header(frame), frame.data()).expect("valid encoded Classic CAN frame")
+        // Embassy 要求 backing buffer 覆盖 DLC，RTR 在线上仍无数据。
+        let data = if frame.is_remote() {
+            &[0; 8]
+        } else {
+            frame.data()
+        };
+        Self::new(encoded_header(frame), data).expect("valid encoded Classic CAN frame")
     }
 }
 
 impl From<&EncodedFrame> for FdFrame {
     fn from(frame: &EncodedFrame) -> Self {
-        Self::new(encoded_header(frame), frame.data()).expect("valid encoded Classic CAN frame")
+        let data = if frame.is_remote() {
+            &[0; 8]
+        } else {
+            frame.data()
+        };
+        Self::new(encoded_header(frame), data).expect("valid encoded Classic CAN frame")
     }
 }
 

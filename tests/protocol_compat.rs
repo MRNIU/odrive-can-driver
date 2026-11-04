@@ -41,7 +41,6 @@ fn embedded_can_converts_bxcan_data_and_remote_frames() {
 mod embassy {
     use super::*;
     use embassy_stm32::can::frame::{FdFrame, Frame, Header};
-    use odrive_can_driver::protocol::compat::embassy::FromEmbassyError;
 
     #[test]
     fn native_conversions_preserve_classic_remote_and_fd() {
@@ -80,18 +79,16 @@ mod embassy {
     }
 
     #[test]
-    fn malformed_public_headers_return_error_without_panicking() {
-        let id = StandardId::new(0x021).unwrap().into();
-        let frame = Frame::new(Header::new(id, 9, false), &[]).unwrap();
-        assert_eq!(
-            FrameRef::try_from(&frame),
-            Err(FromEmbassyError::InvalidPayloadLength)
-        );
-        let frame = FdFrame::new(Header::new_fd(id, 65, false, false), &[]).unwrap();
-        assert_eq!(
-            FrameRef::try_from(&frame),
-            Err(FromEmbassyError::InvalidPayloadLength)
-        );
+    fn encoded_commands_preserve_payload_in_classic_containers() {
+        let command = encode(
+            NodeId::new(1).unwrap(),
+            Message::Command(Command::SetInputTorque { torque: -2.5 }),
+        )
+        .unwrap();
+        let classic: Frame = (&command).into();
+        let container: FdFrame = (&command).into();
+        assert_eq!(FrameRef::try_from(&classic).unwrap(), command.as_ref());
+        assert_eq!(FrameRef::try_from(&container).unwrap(), command.as_ref());
     }
 }
 

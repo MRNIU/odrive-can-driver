@@ -242,10 +242,10 @@ odrive_can_driver = { version = "0.3.0", features = ["embassy-stm32"] }
 embassy-stm32 = { version = "0.6.0", features = ["stm32h723vg"] }
 
 [patch.crates-io]
-embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", rev = "7b08a9c7d9a9fe620f4be25c4e7b86dd29f09f54" }
+embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", rev = "b48dc1b51d0d788396a04b5d819172ee0b66bd81" }
 ```
 
-registry `embassy-stm32 0.6.0` 的 RTR DLC 8 发送缺陷由上述修订修复。取消证据同样仅针对这个固定修订的**非缓冲** `CanTx::write`：[`TxMode::write_generic`](https://github.com/embassy-rs/embassy/blob/7b08a9c7d9a9fe620f4be25c4e7b86dd29f09f54/embassy-stm32/src/can/fdcan.rs#L984-L999) 在一次 poll 内同步调用寄存器发送，入队成功直接 `Ready`，只有 `WouldBlock` 才 `Pending`。[寄存器层的两个 `WouldBlock` 分支](https://github.com/embassy-rs/embassy/blob/7b08a9c7d9a9fe620f4be25c4e7b86dd29f09f54/embassy-stm32/src/can/fd/peripheral.rs#L227-L259) 都发生在写入新帧之前；成功置换旧帧则通过 `Ready` 返回该帧。该 future 结束后没有后台重试提交路径。不能将这个结论推广到 buffered CAN、其他 HAL 或其他 Embassy revision。
+registry `embassy-stm32 0.6.0` 的 RTR DLC 8 发送缺陷由上述修订修复。取消证据同样仅针对这个固定修订的**非缓冲** `CanTx::write`：[`TxMode::write_generic`](https://github.com/embassy-rs/embassy/blob/b48dc1b51d0d788396a04b5d819172ee0b66bd81/embassy-stm32/src/can/fdcan.rs#L1025-L1044) 在一次 poll 内同步调用寄存器发送，入队成功直接 `Ready`，只有 `WouldBlock` 才 `Pending`。[寄存器层的两个 `WouldBlock` 分支](https://github.com/embassy-rs/embassy/blob/b48dc1b51d0d788396a04b5d819172ee0b66bd81/embassy-stm32/src/can/fd/peripheral.rs#L274-L307) 都发生在写入新帧之前；成功置换旧帧则通过 `Ready` 返回该帧。该 future 结束后没有后台重试提交路径。不能将这个结论推广到 buffered CAN、其他 HAL 或其他 Embassy revision。
 
 应用通过 `Can::split` 获取 `CanTx` / `CanRx`。TX 每次 poll 前经过 Driver 门禁；RX 保留完整 `FdEnvelope`，包括 Classic/FD/RTR 标志和原生时间戳。启用 Embassy `time`（通常由应用的 `time-driver-*` 启用）时，`ts` 是 Embassy `Instant`，可用 `as_micros()` 映射；未启用时是原生 16-bit 控制器时间戳，应用须处理其时钟域与回绕，不能直接当作 Driver 绝对时间。TX 等待期间应用照常接收、推进期限及响应取消。示例展示同一个调度循环中的这些步骤；库不另建任务、不加内部锁。
 

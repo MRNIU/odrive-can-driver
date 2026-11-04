@@ -17,7 +17,7 @@ jobs:
     name: 协议与默认核心
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -32,7 +32,7 @@ jobs:
     name: embedded-can
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -47,7 +47,7 @@ jobs:
     name: Linux SocketCAN
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -69,17 +69,21 @@ jobs:
     name: Embassy STM32H723
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
           targets: thumbv7em-none-eabihf
       - run: >-
-          cargo test --locked --test embassy --test protocol_compat
+          cargo test --locked --all-targets
           --features embassy-stm32,embassy-stm32/stm32h723vg
       - run: >-
           cargo check --locked --example embassy_stm32 --target thumbv7em-none-eabihf
           --features embassy-stm32,embassy-stm32/stm32h723vg
+      - name: 检查应用启用 Embassy time 的配置
+        run: >-
+          cargo check --locked --lib --example embassy_stm32 --target thumbv7em-none-eabihf
+          --features embassy-stm32,embassy-stm32/stm32h723vg,embassy-stm32/time
       - run: >-
           cargo clippy --locked --lib --target thumbv7em-none-eabihf
           --features embedded-can,embassy-stm32,embassy-stm32/stm32h723vg -- -D warnings

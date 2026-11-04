@@ -1,13 +1,13 @@
 // Copyright The odrive-can-driver Contributors
-//! 验证 Embassy FDCAN 接收路径把无关原生帧归还给共享总线调用方。
+//! 验证 Embassy 查询帧构造，以及接收路径保留共享总线的原生帧。
 
 #![cfg(feature = "embassy-stm32")]
 
-use embassy_stm32::can::frame::{FdEnvelope, FdFrame, Header};
+use embassy_stm32::can::frame::{FdEnvelope, FdFrame, Frame, Header};
 use odrive_can_driver::{
     Driver, IngestResult, Instant, Session,
     embassy::{EmbassyReceive, ingest_fd_envelope},
-    protocol::NodeId,
+    protocol::{NodeId, Query},
 };
 
 fn node() -> NodeId {
@@ -16,6 +16,50 @@ fn node() -> NodeId {
 
 fn driver(session: &mut Session) -> Driver<'_> {
     Driver::new(session, node())
+}
+
+#[test]
+fn all_driver_queries_construct_classic_rtr_frames_for_every_node() {
+    let queries = [
+        (Query::MotorError, 0x03),
+        (Query::EncoderError, 0x04),
+        (Query::SensorlessError, 0x05),
+        (Query::EncoderEstimates, 0x09),
+        (Query::EncoderCount, 0x0a),
+        (Query::Iq, 0x14),
+        (Query::SensorlessEstimates, 0x15),
+        (Query::VbusVoltage, 0x17),
+    ];
+    for node_id in 0..=63 {
+        for (query, command_id) in queries {
+            let mut session = Session::new();
+            let mut driver = Driver::new(&mut session, NodeId::new(node_id).unwrap());
+            let permit = driver
+                .prepare_query(query, Instant::from_micros(0), Instant::from_micros(10))
+                .unwrap();
+            let attempt = driver.begin_send(permit, Instant::from_micros(1)).unwrap();
+            let encoded = driver
+                .authorize_tx(&attempt, Instant::from_micros(2))
+                .unwrap();
+            assert!(encoded.data().is_empty());
+            // 与 EmbassyTx::poll 相同的原生构造调用；不访问控制器寄存器。
+            let classic = Frame::from(&encoded);
+            let container = FdFrame::from(&encoded);
+            for header in [classic.header(), container.header()] {
+                assert_eq!(
+                    *header.id(),
+                    embedded_can::Id::Standard(
+                        embedded_can::StandardId::new(((node_id as u16) << 5) | command_id)
+                            .unwrap()
+                    )
+                );
+                assert!(header.rtr());
+                assert_eq!(header.len(), 8);
+                assert!(!header.fdcan());
+                assert!(!header.bit_rate_switching());
+            }
+        }
+    }
 }
 
 #[test]

@@ -6,7 +6,7 @@
 //! one native poll, so applications can keep RX, deadlines, and cancellation in their own loop.
 //!
 //! The cancellation proof is specific to Embassy revision
-//! `7b08a9c7d9a9fe620f4be25c4e7b86dd29f09f54`: `TxMode::write_generic` returns
+//! `b48dc1b51d0d788396a04b5d819172ee0b66bd81`: `TxMode::write_generic` returns
 //! `Poll::Pending` only when `Registers::write` returned `WouldBlock`, before the new frame is
 //! put in message RAM. This adapter drops that native future before returning `Pending`.
 

@@ -22,6 +22,28 @@ fn data(id: u16, bytes: &[u8]) -> FrameRef<'_> {
     }
 }
 
+// 将独立字节向量继续送入真实后端构造器，覆盖依赖升级后的长度与帧类型合同。
+#[cfg(feature = "embedded-can")]
+fn assert_native_conversions(encoded: &odrive_can_driver::protocol::EncodedFrame) {
+    let native: bxcan::Frame = encoded.to_embedded_can().unwrap();
+    assert_eq!(
+        FrameRef::from_classic_embedded_can(&native).unwrap(),
+        encoded.as_ref()
+    );
+    #[cfg(feature = "embassy-stm32")]
+    {
+        let classic: embassy_stm32::can::frame::Frame = encoded.into();
+        let container: embassy_stm32::can::frame::FdFrame = encoded.into();
+        assert_eq!(FrameRef::try_from(&classic).unwrap(), encoded.as_ref());
+        assert_eq!(FrameRef::try_from(&container).unwrap(), encoded.as_ref());
+    }
+    #[cfg(all(feature = "socketcan", target_os = "linux"))]
+    {
+        let native: socketcan::CanFrame = encoded.into();
+        assert_eq!(FrameRef::try_from(&native).unwrap(), encoded.as_ref());
+    }
+}
+
 #[test]
 fn encodes_every_write_command_to_its_documented_bytes() {
     let reassigned = NodeId::new(63).unwrap();
@@ -130,6 +152,8 @@ fn encodes_every_write_command_to_its_documented_bytes() {
         assert_eq!(encoded.dlc(), expected.len() as u8);
         assert!(!encoded.is_remote());
         assert_eq!(encoded.as_ref(), data(*id, expected));
+        #[cfg(feature = "embedded-can")]
+        assert_native_conversions(&encoded);
     }
 }
 
@@ -236,6 +260,8 @@ fn encodes_all_rtr_queries_with_dlc_eight() {
         assert_eq!(encoded.data(), &[]);
         assert_eq!(encoded.dlc(), 8);
         assert!(encoded.is_remote());
+        #[cfg(feature = "embedded-can")]
+        assert_native_conversions(&encoded);
         assert_eq!(
             encoded.as_ref(),
             FrameRef {
@@ -348,6 +374,8 @@ fn encodes_and_decodes_all_device_responses() {
         assert_eq!(encoded.data(), bytes);
         assert_eq!(encoded.dlc(), 8);
         assert!(!encoded.is_remote());
+        #[cfg(feature = "embedded-can")]
+        assert_native_conversions(&encoded);
         let decoded = decode(node(), data(*id, bytes)).unwrap().unwrap();
         match (response, decoded) {
             (
