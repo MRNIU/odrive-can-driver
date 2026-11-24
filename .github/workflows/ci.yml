@@ -1,5 +1,5 @@
 # Copyright The odrive-can-driver Contributors
-# 使用 Rust stable 验证协议、共享核心和三个可选后端。
+# 验证 Rust 与原生 C 的协议、驱动、后端和消费入口。
 
 name: CI
 
@@ -27,6 +27,11 @@ jobs:
       - run: cargo test --locked --doc
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --locked --lib --target thumbv6m-none-eabi
+      - name: 确认共享测试数据随 crate 打包
+        run: |
+          package_files="$(cargo package --locked --list)"
+          printf '%s\n' "$package_files" | grep -Fx 'tests/fixtures/fw_v0_5_1.tsv'
+          printf '%s\n' "$package_files" | grep -Fx 'tests/fixtures/driver_traces.tsv'
 
   embedded_can:
     name: embedded-can
@@ -93,3 +98,57 @@ jobs:
         run: >-
           cargo doc --locked --no-deps
           --features embedded-can,socketcan,embassy-stm32,embassy-stm32/stm32h723vg
+
+  c_host:
+    name: C17 宿主 (${{ matrix.compiler }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - compiler: gcc
+            sanitizer_flags: ""
+          - compiler: clang
+            sanitizer_flags: "-fsanitize=address,undefined -fno-sanitize-recover=all"
+    env:
+      CC: ${{ matrix.compiler }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: 构建并运行测试与示例
+        run: |
+          cmake -S . -B build/c-host -DCMAKE_BUILD_TYPE=Debug \
+            "-DCMAKE_C_FLAGS=-Wall -Wextra -Wpedantic -Werror ${{ matrix.sanitizer_flags }}"
+          cmake --build build/c-host --parallel
+          ctest --test-dir build/c-host --output-on-failure --no-tests=error
+      - name: 验证外部 CMake 消费者
+        if: matrix.compiler == 'gcc'
+        run: |
+          cmake -S c/tests/consumer -B build/c-consumer -DBUILD_TESTING=ON
+          cmake --build build/c-consumer --parallel
+          ctest --test-dir build/c-consumer --show-only=json-v1 | python3 -c \
+            'import json, sys; assert [test["name"] for test in json.load(sys.stdin)["tests"]] == ["odrive_can_consumer"]'
+          ctest --test-dir build/c-consumer --output-on-failure --no-tests=error
+      - name: 验证 C API 文档
+        if: matrix.compiler == 'gcc'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends doxygen
+          # Doxygen 只检查有文件文档的 C 头中的全局函数。
+          for header in c/include/odrive_can_driver/*.h; do
+            grep -Fq '@file' "$header"
+          done
+          doxygen Doxyfile
+
+  c_cortex_m7:
+    name: C17 Cortex-M7 链接
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: 安装 ARM GCC 和 Newlib
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi libnewlib-arm-none-eabi
+      - name: 交叉链接 CMake 消费者
+        run: |
+          cmake -S c/tests/consumer -B build/c-consumer-m7 -DBUILD_TESTING=OFF \
+            --toolchain "$GITHUB_WORKSPACE/c/tests/consumer/cortex-m7.cmake"
+          cmake --build build/c-consumer-m7 --parallel

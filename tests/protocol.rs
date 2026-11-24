@@ -1,26 +1,11 @@
 // Copyright The odrive-can-protocol Contributors
 
-//! 使用独立字节向量验证 fw-v0.5.1 的命令、查询、回复和输入边界。
-//!
-//! 测试直接给定预期 ID、字段位置与端序，不以编解码自循环代替协议依据。
+//! 用 C 与 Rust 共用的独立向量验证 fw-v0.5.1 协议。
 
 use odrive_can_driver::protocol::{
     AxisState, Command, DecodeError, EncodeError, FrameId, FramePayload, FrameRef, Message, NodeId,
     Query, Response, decode, encode,
 };
-
-type CommandBuilder = fn(f32) -> Command;
-
-fn node() -> NodeId {
-    NodeId::new(3).unwrap()
-}
-
-fn data(id: u16, bytes: &[u8]) -> FrameRef<'_> {
-    FrameRef {
-        id: FrameId::Standard(id),
-        payload: FramePayload::Data(bytes),
-    }
-}
 
 // 将独立字节向量继续送入真实后端构造器，覆盖依赖升级后的长度与帧类型合同。
 #[cfg(feature = "embedded-can")]
@@ -44,519 +29,316 @@ fn assert_native_conversions(encoded: &odrive_can_driver::protocol::EncodedFrame
     }
 }
 
-#[test]
-fn encodes_every_write_command_to_its_documented_bytes() {
-    let reassigned = NodeId::new(63).unwrap();
-    let cases: &[(Command, u16, &[u8])] = &[
-        (Command::Estop, 0x62, &[]),
-        (
-            Command::SetAxisNodeId {
-                node_id: reassigned,
-            },
-            0x66,
-            &[63, 0, 0, 0],
-        ),
-        (
-            Command::SetAxisRequestedState {
-                state: AxisState(0x8000_0008),
-            },
-            0x67,
-            &[8, 0, 0, 128],
-        ),
-        (
-            Command::SetControllerModes {
-                control_mode: -2,
-                input_mode: 5,
-            },
-            0x6b,
-            &[254, 255, 255, 255, 5, 0, 0, 0],
-        ),
-        (
-            Command::SetInputPos {
-                position: 1.5,
-                velocity_ff: -2,
-                torque_ff: 3,
-            },
-            0x6c,
-            &[0, 0, 192, 63, 254, 255, 3, 0],
-        ),
-        (
-            Command::SetInputVel {
-                velocity: -0.0,
-                torque_ff: 2.5,
-            },
-            0x6d,
-            &[0, 0, 0, 128, 0, 0, 32, 64],
-        ),
-        (
-            Command::SetInputVel {
-                velocity: 0.0,
-                torque_ff: -2.5,
-            },
-            0x6d,
-            &[0, 0, 0, 0, 0, 0, 32, 192],
-        ),
-        (
-            Command::SetInputVel {
-                velocity: 1.5,
-                torque_ff: 0.25,
-            },
-            0x6d,
-            &[0, 0, 192, 63, 0, 0, 128, 62],
-        ),
-        (
-            Command::SetInputVel {
-                velocity: -2.5,
-                torque_ff: 0.25,
-            },
-            0x6d,
-            &[0, 0, 32, 192, 0, 0, 128, 62],
-        ),
-        (
-            Command::SetInputTorque { torque: -1.25 },
-            0x6e,
-            &[0, 0, 160, 191],
-        ),
-        (
-            Command::SetVelocityLimit { velocity: 3.0 },
-            0x6f,
-            &[0, 0, 64, 64],
-        ),
-        (Command::StartAnticogging, 0x70, &[]),
-        (
-            Command::SetTrajVelLimit { velocity: 4.0 },
-            0x71,
-            &[0, 0, 128, 64],
-        ),
-        (
-            Command::SetTrajAccelLimits {
-                acceleration: 5.0,
-                deceleration: 6.0,
-            },
-            0x72,
-            &[0, 0, 160, 64, 0, 0, 192, 64],
-        ),
-        (
-            Command::SetTrajInertia { inertia: 7.0 },
-            0x73,
-            &[0, 0, 224, 64],
-        ),
-        (Command::Reboot, 0x76, &[]),
-        (Command::ClearErrors, 0x78, &[]),
-    ];
-
-    for (command, id, expected) in cases {
-        let encoded = encode(node(), Message::Command(*command)).unwrap();
-        assert_eq!(encoded.id(), *id);
-        assert_eq!(encoded.data(), *expected);
-        assert_eq!(encoded.dlc(), expected.len() as u8);
-        assert!(!encoded.is_remote());
-        assert_eq!(encoded.as_ref(), data(*id, expected));
-        #[cfg(feature = "embedded-can")]
-        assert_native_conversions(&encoded);
+fn unsigned_number(text: &str) -> u32 {
+    if let Some(hex) = text.strip_prefix("0x") {
+        u32::from_str_radix(hex, 16).unwrap()
+    } else {
+        text.parse().unwrap()
     }
 }
 
-#[test]
-fn decodes_every_write_command_from_its_documented_bytes() {
-    let cases: &[(u16, &[u8], Command)] = &[
-        (0x62, &[], Command::Estop),
-        (
-            0x66,
-            &[63, 0, 0, 0],
-            Command::SetAxisNodeId {
-                node_id: NodeId::new(63).unwrap(),
-            },
-        ),
-        (
-            0x67,
-            &[8, 0, 0, 128],
-            Command::SetAxisRequestedState {
-                state: AxisState(0x8000_0008),
-            },
-        ),
-        (
-            0x6b,
-            &[254, 255, 255, 255, 5, 0, 0, 0],
-            Command::SetControllerModes {
-                control_mode: -2,
-                input_mode: 5,
-            },
-        ),
-        (
-            0x6c,
-            &[0, 0, 192, 63, 254, 255, 3, 0],
-            Command::SetInputPos {
-                position: 1.5,
-                velocity_ff: -2,
-                torque_ff: 3,
-            },
-        ),
-        (
-            0x6d,
-            &[0, 0, 0, 128, 0, 0, 32, 64],
-            Command::SetInputVel {
-                velocity: -0.0,
-                torque_ff: 2.5,
-            },
-        ),
-        (
-            0x6e,
-            &[0, 0, 160, 191],
-            Command::SetInputTorque { torque: -1.25 },
-        ),
-        (
-            0x6f,
-            &[0, 0, 64, 64],
-            Command::SetVelocityLimit { velocity: 3.0 },
-        ),
-        (0x70, &[], Command::StartAnticogging),
-        (
-            0x71,
-            &[0, 0, 128, 64],
-            Command::SetTrajVelLimit { velocity: 4.0 },
-        ),
-        (
-            0x72,
-            &[0, 0, 160, 64, 0, 0, 192, 64],
-            Command::SetTrajAccelLimits {
-                acceleration: 5.0,
-                deceleration: 6.0,
-            },
-        ),
-        (
-            0x73,
-            &[0, 0, 224, 64],
-            Command::SetTrajInertia { inertia: 7.0 },
-        ),
-        (0x76, &[], Command::Reboot),
-        (0x78, &[], Command::ClearErrors),
-    ];
-
-    for (id, bytes, expected) in cases {
-        assert_eq!(
-            decode(node(), data(*id, bytes)).unwrap(),
-            Some(Message::Command(*expected))
-        );
+fn field_bits(text: &str) -> u32 {
+    if text.starts_with('-') {
+        text.parse::<i32>().unwrap() as u32
+    } else {
+        unsigned_number(text)
     }
 }
 
-#[test]
-fn encodes_all_rtr_queries_with_dlc_eight() {
-    let cases = [
-        (Query::MotorError, 0x63),
-        (Query::EncoderError, 0x64),
-        (Query::SensorlessError, 0x65),
-        (Query::EncoderEstimates, 0x69),
-        (Query::EncoderCount, 0x6a),
-        (Query::Iq, 0x74),
-        (Query::SensorlessEstimates, 0x75),
-        (Query::VbusVoltage, 0x77),
-    ];
+fn expected_message(tag: &str, fields: &[u32]) -> Message {
+    let float = f32::from_bits;
 
-    for (query, id) in cases {
-        let encoded = encode(node(), Message::Request(query)).unwrap();
-        assert_eq!(encoded.id(), id);
-        assert_eq!(encoded.data(), &[]);
-        assert_eq!(encoded.dlc(), 8);
-        assert!(encoded.is_remote());
-        #[cfg(feature = "embedded-can")]
-        assert_native_conversions(&encoded);
-        assert_eq!(
-            encoded.as_ref(),
-            FrameRef {
-                id: FrameId::Standard(id),
-                payload: FramePayload::Remote { dlc: 8 }
+    let command = match (tag, fields) {
+        ("estop", []) => Command::Estop,
+        ("set_axis_node_id", [id]) => Command::SetAxisNodeId {
+            node_id: NodeId::new(*id).unwrap(),
+        },
+        ("set_axis_requested_state", [state]) => Command::SetAxisRequestedState {
+            state: AxisState(*state),
+        },
+        ("set_controller_modes", [control, input]) => Command::SetControllerModes {
+            control_mode: *control as i32,
+            input_mode: *input as i32,
+        },
+        ("set_input_pos", [position, velocity, torque]) => Command::SetInputPos {
+            position: float(*position),
+            velocity_ff: i16::try_from(*velocity as i32).unwrap(),
+            torque_ff: i16::try_from(*torque as i32).unwrap(),
+        },
+        ("set_input_vel", [velocity, torque]) => Command::SetInputVel {
+            velocity: float(*velocity),
+            torque_ff: float(*torque),
+        },
+        ("set_input_torque", [torque]) => Command::SetInputTorque {
+            torque: float(*torque),
+        },
+        ("set_velocity_limit", [velocity]) => Command::SetVelocityLimit {
+            velocity: float(*velocity),
+        },
+        ("start_anticogging", []) => Command::StartAnticogging,
+        ("set_traj_vel_limit", [velocity]) => Command::SetTrajVelLimit {
+            velocity: float(*velocity),
+        },
+        ("set_traj_accel_limits", [acceleration, deceleration]) => Command::SetTrajAccelLimits {
+            acceleration: float(*acceleration),
+            deceleration: float(*deceleration),
+        },
+        ("set_traj_inertia", [inertia]) => Command::SetTrajInertia {
+            inertia: float(*inertia),
+        },
+        ("reboot", []) => Command::Reboot,
+        ("clear_errors", []) => Command::ClearErrors,
+        ("query_motor_error", []) => return Message::Request(Query::MotorError),
+        ("query_encoder_error", []) => return Message::Request(Query::EncoderError),
+        ("query_sensorless_error", []) => return Message::Request(Query::SensorlessError),
+        ("query_encoder_estimates", []) => return Message::Request(Query::EncoderEstimates),
+        ("query_encoder_count", []) => return Message::Request(Query::EncoderCount),
+        ("query_iq", []) => return Message::Request(Query::Iq),
+        ("query_sensorless_estimates", []) => return Message::Request(Query::SensorlessEstimates),
+        ("query_vbus_voltage", []) => return Message::Request(Query::VbusVoltage),
+        ("heartbeat", [error, state]) => {
+            return Message::Response(Response::Heartbeat {
+                axis_error: *error,
+                axis_state: AxisState(*state),
+            });
+        }
+        ("motor_error", [bits]) => return Message::Response(Response::MotorError(*bits)),
+        ("encoder_error", [bits]) => return Message::Response(Response::EncoderError(*bits)),
+        ("sensorless_error", [bits]) => return Message::Response(Response::SensorlessError(*bits)),
+        ("encoder_estimates", [position, velocity]) => {
+            return Message::Response(Response::EncoderEstimates {
+                position: float(*position),
+                velocity: float(*velocity),
+            });
+        }
+        ("encoder_count", [shadow, cpr]) => {
+            return Message::Response(Response::EncoderCount {
+                shadow_count: *shadow as i32,
+                count_in_cpr: *cpr as i32,
+            });
+        }
+        ("iq", [setpoint, measured]) => {
+            return Message::Response(Response::Iq {
+                setpoint: float(*setpoint),
+                measured: float(*measured),
+            });
+        }
+        ("sensorless_estimates", [position, velocity]) => {
+            return Message::Response(Response::SensorlessEstimates {
+                position: float(*position),
+                velocity: float(*velocity),
+            });
+        }
+        ("vbus_voltage", [voltage]) => {
+            return Message::Response(Response::VbusVoltage(float(*voltage)));
+        }
+        _ => panic!("invalid message fixture: {tag} {fields:?}"),
+    };
+    Message::Command(command)
+}
+
+fn decode_error(tag: &str, fields: &[u32]) -> Option<DecodeError> {
+    Some(match (tag, fields) {
+        ("invalid_standard_id", [id]) => {
+            DecodeError::InvalidStandardId(u16::try_from(*id).unwrap())
+        }
+        ("unsupported_extended_id", []) => DecodeError::UnsupportedExtendedId,
+        ("unsupported_can_fd", []) => DecodeError::UnsupportedCanFd,
+        ("unsupported_command", [command_id]) => DecodeError::UnsupportedCommand {
+            command_id: u8::try_from(*command_id).unwrap(),
+        },
+        ("invalid_frame_kind", [command_id]) => DecodeError::InvalidFrameKind {
+            command_id: u8::try_from(*command_id).unwrap(),
+        },
+        ("invalid_length", [command_id, expected, actual]) => DecodeError::InvalidLength {
+            command_id: u8::try_from(*command_id).unwrap(),
+            expected: u8::try_from(*expected).unwrap(),
+            actual: usize::try_from(*actual).unwrap(),
+        },
+        ("invalid_remote_dlc", [dlc]) => DecodeError::InvalidRemoteDlc {
+            dlc: u8::try_from(*dlc).unwrap(),
+        },
+        ("invalid_node_id", [id]) => DecodeError::InvalidNodeId(*id),
+        _ => return None,
+    })
+}
+
+// PartialEq 单独使用会忽略零的符号并拒绝相同位模式的 NaN。
+fn float_payload_bits(message: Message) -> Option<[u32; 3]> {
+    use Message::{Command as Cmd, Response as Resp};
+
+    let (first, second) = match message {
+        Cmd(Command::SetInputPos {
+            position,
+            velocity_ff,
+            torque_ff,
+        }) => return Some([position.to_bits(), velocity_ff as u32, torque_ff as u32]),
+        Cmd(Command::SetInputVel {
+            velocity,
+            torque_ff,
+        }) => (velocity, torque_ff),
+        Cmd(Command::SetInputTorque { torque }) => (torque, 0.0),
+        Cmd(Command::SetVelocityLimit { velocity } | Command::SetTrajVelLimit { velocity }) => {
+            (velocity, 0.0)
+        }
+        Cmd(Command::SetTrajAccelLimits {
+            acceleration,
+            deceleration,
+        }) => (acceleration, deceleration),
+        Cmd(Command::SetTrajInertia { inertia }) => (inertia, 0.0),
+        Resp(
+            Response::EncoderEstimates { position, velocity }
+            | Response::SensorlessEstimates { position, velocity },
+        ) => (position, velocity),
+        Resp(Response::Iq { setpoint, measured }) => (setpoint, measured),
+        Resp(Response::VbusVoltage(voltage)) => (voltage, 0.0),
+        _ => return None,
+    };
+    Some([first.to_bits(), second.to_bits(), 0])
+}
+
+fn assert_message(actual: Message, expected: Message, row: &str) {
+    use core::mem::discriminant;
+
+    let Some(bits) = float_payload_bits(expected) else {
+        assert_eq!(actual, expected, "{row}");
+        return;
+    };
+    match (actual, expected) {
+        (Message::Command(actual), Message::Command(expected)) => {
+            assert_eq!(discriminant(&actual), discriminant(&expected), "{row}");
+        }
+        (Message::Response(actual), Message::Response(expected)) => {
+            assert_eq!(discriminant(&actual), discriminant(&expected), "{row}");
+        }
+        _ => panic!("{row}: unexpected message {actual:?}"),
+    }
+    assert_eq!(float_payload_bits(actual), Some(bits), "{row}");
+}
+
+#[test]
+fn shared_protocol_vectors() {
+    let mut case_count = 0;
+    for row in include_str!("fixtures/fw_v0_5_1.tsv").lines() {
+        if row.is_empty() || row.starts_with('#') {
+            continue;
+        }
+        case_count += 1;
+        let columns: Vec<_> = row.split('\t').collect();
+        let [mode, node, id, frame, dlc, payload, tag, fields] = columns.as_slice() else {
+            panic!("invalid vector: {row}");
+        };
+        let fields: Vec<_> = if *fields == "-" {
+            Vec::new()
+        } else {
+            fields.split(',').map(field_bits).collect()
+        };
+        let raw_node = unsigned_number(node);
+        match *mode {
+            "both" | "decode" => {}
+            "reject_invalid_node"
+            | "reject_position"
+            | "reject_velocity"
+            | "reject_torque_ff"
+            | "reject_torque"
+            | "reject_acceleration"
+            | "reject_deceleration"
+            | "reject_inertia" => {
+                assert_eq!([*id, *frame, *dlc, *payload], ["-"; 4], "{row}");
+                let message = expected_message(tag, &fields);
+                if *mode == "reject_invalid_node" {
+                    assert_eq!(
+                        NodeId::new(raw_node),
+                        Err(EncodeError::InvalidNodeId(raw_node)),
+                        "{row}"
+                    );
+                } else {
+                    let field = mode.strip_prefix("reject_").unwrap();
+                    assert_eq!(
+                        encode(NodeId::new(raw_node).unwrap(), message),
+                        Err(EncodeError::NonFinite { field }),
+                        "{row}"
+                    );
+                }
+                continue;
             }
-        );
-    }
-}
-
-#[test]
-fn decodes_rtr_queries_with_any_classic_dlc() {
-    let cases = [
-        (Query::MotorError, 0x63),
-        (Query::EncoderError, 0x64),
-        (Query::SensorlessError, 0x65),
-        (Query::EncoderEstimates, 0x69),
-        (Query::EncoderCount, 0x6a),
-        (Query::Iq, 0x74),
-        (Query::SensorlessEstimates, 0x75),
-        (Query::VbusVoltage, 0x77),
-    ];
-
-    for (query, id) in cases {
-        for dlc in 0..=8 {
-            assert_eq!(
-                decode(
-                    node(),
-                    FrameRef {
-                        id: FrameId::Standard(id),
-                        payload: FramePayload::Remote { dlc }
+            _ => panic!("invalid mode: {row}"),
+        }
+        let node = NodeId::new(raw_node).unwrap();
+        let bytes: Vec<u8> = if *payload == "-" {
+            Vec::new()
+        } else {
+            assert!(
+                payload.len() <= 16 && payload.len().is_multiple_of(2),
+                "{row}"
+            );
+            assert!(
+                payload.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "{row}"
+            );
+            (0..payload.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&payload[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        let id = unsigned_number(id);
+        let dlc =
+            u8::try_from(unsigned_number(dlc)).unwrap_or_else(|_| panic!("invalid DLC: {row}"));
+        let input = FrameRef {
+            id: if matches!(*frame, "extended_fd" | "extended_data") {
+                FrameId::Extended(id)
+            } else {
+                FrameId::Standard(u16::try_from(id).unwrap_or_else(|_| panic!("invalid ID: {row}")))
+            },
+            payload: match *frame {
+                "data" | "extended_data" => {
+                    assert_eq!(usize::from(dlc), bytes.len(), "{row}");
+                    FramePayload::Data(&bytes)
+                }
+                "rtr" => {
+                    assert!(bytes.is_empty(), "{row}");
+                    FramePayload::Remote { dlc }
+                }
+                "fd" | "extended_fd" => FramePayload::Fd(&bytes),
+                _ => panic!("invalid frame: {row}"),
+            },
+        };
+        let decoded = decode(node, input);
+        match *tag {
+            "unrelated" => {
+                assert_eq!(*mode, "decode", "{row}");
+                assert!(fields.is_empty(), "{row}");
+                assert_eq!(decoded, Ok(None), "{row}");
+            }
+            _ if let Some(error) = decode_error(tag, &fields) => {
+                assert_eq!(*mode, "decode", "{row}");
+                assert_eq!(decoded, Err(error), "{row}");
+            }
+            _ => {
+                let expected = expected_message(tag, &fields);
+                let actual = decoded
+                    .unwrap_or_else(|error| panic!("{row}: {error}"))
+                    .unwrap_or_else(|| panic!("{row}: expected a decoded message"));
+                assert_message(actual, expected, row);
+                if *mode == "both" {
+                    let encoded = encode(node, expected).unwrap();
+                    assert_eq!(encoded.dlc(), dlc, "{row}");
+                    assert_eq!(encoded.data(), bytes, "{row}");
+                    assert_eq!(encoded.as_ref(), input, "{row}");
+                    #[cfg(feature = "embedded-can")]
+                    assert_native_conversions(&encoded);
+                    if encoded.is_remote() {
+                        for dlc in 0..=8 {
+                            let input = FrameRef {
+                                payload: FramePayload::Remote { dlc },
+                                ..input
+                            };
+                            assert_eq!(decode(node, input), Ok(Some(expected)), "{row}");
+                        }
                     }
-                )
-                .unwrap(),
-                Some(Message::Request(query))
-            );
+                }
+            }
         }
     }
-}
-
-#[test]
-fn encodes_and_decodes_all_device_responses() {
-    let nan = f32::from_bits(0x7fc0_0123);
-    let cases: &[(Response, u16, [u8; 8])] = &[
-        (
-            Response::Heartbeat {
-                axis_error: 0x8000_0001,
-                axis_state: AxisState(0x8000_0001),
-            },
-            0x61,
-            [1, 0, 0, 128, 1, 0, 0, 128],
-        ),
-        (
-            Response::MotorError(0x0102_0304),
-            0x63,
-            [4, 3, 2, 1, 0, 0, 0, 0],
-        ),
-        (
-            Response::EncoderError(0x1112_1314),
-            0x64,
-            [20, 19, 18, 17, 0, 0, 0, 0],
-        ),
-        (
-            Response::SensorlessError(0x2122_2324),
-            0x65,
-            [36, 35, 34, 33, 0, 0, 0, 0],
-        ),
-        (
-            Response::EncoderEstimates {
-                position: 1.5,
-                velocity: -2.0,
-            },
-            0x69,
-            [0, 0, 192, 63, 0, 0, 0, 192],
-        ),
-        (
-            Response::EncoderCount {
-                shadow_count: -2,
-                count_in_cpr: 7,
-            },
-            0x6a,
-            [254, 255, 255, 255, 7, 0, 0, 0],
-        ),
-        (
-            Response::Iq {
-                setpoint: -0.0,
-                measured: 2.5,
-            },
-            0x74,
-            [0, 0, 0, 128, 0, 0, 32, 64],
-        ),
-        (
-            Response::SensorlessEstimates {
-                position: nan,
-                velocity: -1.0,
-            },
-            0x75,
-            [35, 1, 192, 127, 0, 0, 128, 191],
-        ),
-        (
-            Response::VbusVoltage(48.0),
-            0x77,
-            [0, 0, 64, 66, 0, 0, 0, 0],
-        ),
-    ];
-
-    for (response, id, bytes) in cases {
-        let encoded = encode(node(), Message::Response(*response)).unwrap();
-        assert_eq!(encoded.id(), *id);
-        assert_eq!(encoded.data(), bytes);
-        assert_eq!(encoded.dlc(), 8);
-        assert!(!encoded.is_remote());
-        #[cfg(feature = "embedded-can")]
-        assert_native_conversions(&encoded);
-        let decoded = decode(node(), data(*id, bytes)).unwrap().unwrap();
-        match (response, decoded) {
-            (
-                Response::SensorlessEstimates { position, velocity },
-                Message::Response(Response::SensorlessEstimates {
-                    position: decoded_position,
-                    velocity: decoded_velocity,
-                }),
-            ) => {
-                assert_eq!(position.to_bits(), decoded_position.to_bits());
-                assert_eq!(velocity.to_bits(), decoded_velocity.to_bits());
-            }
-            (expected, Message::Response(actual)) => assert_eq!(*expected, actual),
-            (_, actual) => panic!("unexpected decoded message: {actual:?}"),
-        }
-    }
-}
-
-#[test]
-fn rejects_invalid_or_unsupported_related_frames() {
-    assert_eq!(NodeId::new(64), Err(EncodeError::InvalidNodeId(64)));
-    assert_eq!(
-        encode(
-            node(),
-            Message::Command(Command::SetInputTorque {
-                torque: f32::INFINITY
-            })
-        ),
-        Err(EncodeError::NonFinite { field: "torque" })
-    );
-    assert_eq!(
-        decode(
-            node(),
-            FrameRef {
-                id: FrameId::Extended(0x123),
-                payload: FramePayload::Data(&[])
-            }
-        ),
-        Err(DecodeError::UnsupportedExtendedId)
-    );
-    assert_eq!(
-        decode(node(), data(0x800, &[])),
-        Err(DecodeError::InvalidStandardId(0x800))
-    );
-    assert_eq!(
-        decode(
-            node(),
-            FrameRef {
-                id: FrameId::Standard(0x61),
-                payload: FramePayload::Fd(&[])
-            }
-        ),
-        Err(DecodeError::UnsupportedCanFd)
-    );
-    assert_eq!(
-        decode(
-            node(),
-            FrameRef {
-                id: FrameId::Standard(0x68),
-                payload: FramePayload::Data(&[])
-            }
-        ),
-        Err(DecodeError::UnsupportedCommand { command_id: 0x08 })
-    );
-    assert_eq!(
-        decode(
-            node(),
-            FrameRef {
-                id: FrameId::Standard(0x61),
-                payload: FramePayload::Remote { dlc: 8 }
-            }
-        ),
-        Err(DecodeError::InvalidFrameKind { command_id: 0x01 })
-    );
-    assert_eq!(
-        decode(node(), data(0x61, &[0; 4])),
-        Err(DecodeError::InvalidLength {
-            command_id: 0x01,
-            expected: 8,
-            actual: 4
-        })
-    );
-    assert_eq!(
-        decode(node(), data(0x6e, &[])),
-        Err(DecodeError::InvalidLength {
-            command_id: 0x0e,
-            expected: 4,
-            actual: 0
-        })
-    );
-    assert_eq!(
-        decode(
-            node(),
-            FrameRef {
-                id: FrameId::Standard(0x69),
-                payload: FramePayload::Remote { dlc: 9 }
-            }
-        ),
-        Err(DecodeError::InvalidRemoteDlc { dlc: 9 })
-    );
-    assert_eq!(
-        decode(node(), data(0x66, &[64, 0, 0, 0])),
-        Err(DecodeError::InvalidNodeId(64))
-    );
-}
-
-#[test]
-fn rejects_nonfinite_values_in_every_host_float_command() {
-    let cases: &[(CommandBuilder, &str)] = &[
-        (
-            |value| Command::SetInputPos {
-                position: value,
-                velocity_ff: 0,
-                torque_ff: 0,
-            },
-            "position",
-        ),
-        (
-            |value| Command::SetInputVel {
-                velocity: value,
-                torque_ff: 0.0,
-            },
-            "velocity",
-        ),
-        (
-            |value| Command::SetInputVel {
-                velocity: 0.0,
-                torque_ff: value,
-            },
-            "torque_ff",
-        ),
-        (|value| Command::SetInputTorque { torque: value }, "torque"),
-        (
-            |value| Command::SetVelocityLimit { velocity: value },
-            "velocity",
-        ),
-        (
-            |value| Command::SetTrajVelLimit { velocity: value },
-            "velocity",
-        ),
-        (
-            |value| Command::SetTrajAccelLimits {
-                acceleration: value,
-                deceleration: 0.0,
-            },
-            "acceleration",
-        ),
-        (
-            |value| Command::SetTrajAccelLimits {
-                acceleration: 0.0,
-                deceleration: value,
-            },
-            "deceleration",
-        ),
-        (
-            |value| Command::SetTrajInertia { inertia: value },
-            "inertia",
-        ),
-    ];
-
-    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-        for (make_command, field) in cases {
-            assert_eq!(
-                encode(node(), Message::Command(make_command(value))),
-                Err(EncodeError::NonFinite { field })
-            );
-        }
-    }
-}
-
-#[test]
-fn ignores_undefined_error_response_tail_bytes() {
-    let message = decode(node(), data(0x63, &[4, 3, 2, 1, 99, 98, 97, 96])).unwrap();
-    assert_eq!(
-        message,
-        Some(Message::Response(Response::MotorError(0x0102_0304)))
-    );
-}
-
-#[test]
-fn ignores_unrelated_nodes_and_unknown_commands_before_payload_validation() {
-    assert_eq!(decode(node(), data(0x41, &[])).unwrap(), None);
-    assert_eq!(decode(node(), data(0x7f, &[])).unwrap(), None);
+    assert!(case_count > 0, "protocol fixture contains no vectors");
 }

@@ -312,13 +312,16 @@ impl ResponseCache {
     pub fn heartbeat_is_fresh(&self, n: Instant, max: Duration) -> bool {
         matches!(self.heartbeat_age(n),Some(v) if v<=max)
     }
-    fn put(&mut self, r: Response, t: Instant) {
-        let i = ResponseKind::of(r).ix();
-        if self.entries[i].is_none_or(|x| x.received_at <= t) {
-            self.entries[i] = Some(CachedResponse {
-                response: r,
-                received_at: t,
-            })
+    /// 保存已按节点筛选的原始回复。`received_at` 是调用方单调微秒时钟域中的接收时刻。
+    ///
+    /// 同类回复按接收时刻更新；时刻相同时保留最后写入的值。查询接纳和控制有效性由调用方另行判断。
+    pub fn record(&mut self, response: Response, received_at: Instant) {
+        let entry = &mut self.entries[ResponseKind::of(response).ix()];
+        if entry.is_none_or(|previous| previous.received_at <= received_at) {
+            *entry = Some(CachedResponse {
+                response,
+                received_at,
+            });
         }
     }
 }
@@ -494,12 +497,11 @@ impl<'s> Driver<'s> {
             sequence,
         })
     }
-    /// Authorizes exactly the next native poll; the returned frame is not an independent permit.
+    /// 检查当前尝试能否执行下一次底层 TX 轮询。后端应在每次轮询前紧接着调用本方法，
+    /// 授权与轮询之间不得挂起，也不得保留返回的帧供后续跳过授权发送。
     ///
-    /// A backend MUST call this immediately before EVERY native TX poll, without a suspension
-    /// between authorization and poll. It must not retain the frame for an ungated later send.
-    /// On error, stop/drop the native future. Already queued or independently progressing I/O
-    /// remains unknown; closing this gate does not retract a hardware queue.
+    /// 发送中首次发现到期时，将当次处理时刻记入 `terminal_at` 并进入 `Unknown`。
+    /// 授权失败后应停止底层轮询并处置在途工作。已入队的帧仍可能发送，硬件队列由调用方处理。
     pub fn authorize_tx(
         &mut self,
         attempt: &TxAttempt<'s>,
@@ -507,12 +509,15 @@ impl<'s> Driver<'s> {
     ) -> Result<EncodedFrame, AttemptError> {
         self.check(attempt)?;
         if let Err((previous, now)) = self.time(at) {
-            self.mark_unknown(previous);
+            if self.active.as_ref().unwrap().report.state == OperationState::Dispatching {
+                self.mark_unknown(previous);
+            }
             return Err(AttemptError::ClockRollback { previous, now });
         }
         let active = self.active.as_mut().unwrap();
-        if at >= active.report.deadline {
-            active.report.state = OperationState::Unknown;
+        if active.report.state == OperationState::Dispatching && at >= active.report.deadline {
+            self.mark_unknown(at);
+            return Err(AttemptError::Revoked(OperationState::Unknown));
         }
         active.report.processed_at = at;
         if active.report.state != OperationState::Dispatching {
@@ -593,11 +598,11 @@ impl<'s> Driver<'s> {
             Ok(TxCompletion::Failed)
         }
     }
-    /// Records proved cancellation without submission, after the native future has ended.
+    /// 底层发送已结束且后端能证明这次尝试始终未入队时，消费该尝试并记录证据。
+    /// 仅取消操作、丢弃 future 或到达期限都不足以证明未入队。
     ///
-    /// Only a backend with evidence for this exact attempt may call this. Ordinary cancellation,
-    /// dropping a generic future, or reaching a deadline is not that evidence. A proof after the
-    /// deadline remains valid: the report is `TimedOut`, with no submission, rather than unknown.
+    /// 若先前已显式取消，按取消请求的时刻记录 `Cancelled`。否则，处理该证明时已到期
+    /// 则记录 `TimedOut`，尚未到期则按底层事件时刻记录 `Cancelled`。
     pub fn cancel_unsubmitted(
         &mut self,
         attempt: TxAttempt<'s>,
@@ -644,10 +649,11 @@ impl<'s> Driver<'s> {
             None => Ok(()),
         }
     }
-    /// Revokes future sends. A live/lost attempt remains unknown until its I/O is resolved.
+    /// 撤销后续发送。已准备的操作可以确认未提交；在途尝试须等底层 I/O 的结果。
     ///
-    /// A prepared operation is provably unsent. Cancelling an already submitted query ends its
-    /// wait and retains `submitted_at`. At equal microsecond values actual submission still wins.
+    /// 取消仍在等待回复的已提交查询会结束等待并保留 `submitted_at`。提交与取消发生在同一微秒时，
+    /// 保留真实提交结果。对于已进入暂定 `TimedOut` 的查询，取消调用返回成功并保持原状态，
+    /// 直到 [`Self::take_report`] 取走报告前仍可接纳窗口内的迟到反馈。
     pub fn cancel(&mut self, id: OperationId<'s>, at: Instant) -> Result<(), ReportError> {
         self.report(id)?;
         self.time(at)
@@ -700,17 +706,15 @@ impl<'s> Driver<'s> {
             Err(e) => return IngestResult::DecodeError(e),
         };
         if let Message::Response(response) = message {
-            self.cache.put(response, received_at);
+            self.cache.record(response, received_at);
             self.candidate(response, received_at);
         }
         IngestResult::Message(message)
     }
-    /// Returns the latest eligible candidate after known submission.
+    /// 在已知提交后返回最新的合格候选。接收时刻必须严格晚于提交时刻且严格早于期限。
     ///
-    /// RX must be strictly later than submission and strictly before deadline. Equal microsecond
-    /// timestamps are ambiguous and excluded. Event-time-valid delayed RX/TX may still be accepted
-    /// after tick reports a timeout, until the application takes that report. Cancellation/rejection
-    /// cannot be undone by later feedback. No pre-existing cache is searched to complete a query.
+    /// 查询进入暂定 `TimedOut` 后，取走报告之前仍可接纳窗口内的迟到反馈。
+    /// 进入 `Cancelled` 或 `Rejected` 后结束接纳。查询只考虑本次操作观察到的回复。
     pub fn pending_response(
         &self,
         id: OperationId<'s>,

@@ -10,11 +10,13 @@
 [![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.98.1-blue.svg)](https://www.rust-lang.org/tools/install)
 
-`odrive_can_driver` 是 ODrive CANSimple 库。它在同一个 crate 中提供硬件无关的 `protocol` 编解码层，以及管理单节点命令、查询、反馈缓存、操作身份、期限和发送结果的 `Driver`。三个可选后端负责实际收发。默认构建保持 `no_std`、无动态分配、无正常第三方依赖。
+`odrive_can_driver` 提供 ODrive CANSimple 的 Rust 和原生 C17 实现。两种语言都提供双向帧编解码、每节点反馈缓存和单操作槽 Driver，使用相同的协议向量与操作时序测试。Rust crate 默认为 `no_std`、无动态分配，三个可选后端负责实际收发。C 静态库使用调用方的固定存储和 CAN 收发接口。
 
-本版本要求 Rust 1.98.1（发布时的最新稳定版）。可选后端还需要各自的平台与外设条件，见下表。
+Rust 用户通过 Cargo 使用本库，C 用户通过 CMake 从源码构建。自行调度共享总线的应用可以单独使用协议与缓存。需要跟踪一次命令或查询的应用可以使用 Driver。
 
-## 安装
+## Rust 接入
+
+Rust crate 要求 Rust 1.98.1 或更高版本。
 
 ```toml
 [dependencies]
@@ -23,6 +25,8 @@ odrive_can_driver = { version = "0.3.1", features = ["embedded-can"] }
 
 按接入方式选择 feature；只使用协议编解码或共享状态机时可省略 `features`，默认是 `[]`。
 
+已发布的 `0.3.1` 通过 `Driver::ingest` 更新缓存。使用本仓新增的独立 `ResponseCache::record` 时，请将 Cargo 依赖指向包含该接口的源码目录或固定 Git 修订。
+
 | feature | 接入方式 | 平台与配置 | 使用入口 |
 |---|---|---|---|
 | `embedded-can` | 实现 `embedded-can 0.4` 的 HAL，非阻塞轮询 | 任何支持本 crate 的目标 | [轮询示例与时序](#embedded-can) |
@@ -30,6 +34,28 @@ odrive_can_driver = { version = "0.3.1", features = ["embedded-can"] }
 | `socketcan` | Linux 非阻塞 SocketCAN，无异步运行时 | Linux 与 SocketCAN 接口 | [命令行示例与时序](#socketcan) |
 
 **Embassy 必须使用下文的 workspace patch**：registry `embassy-stm32 0.6.0` 存在 RTR DLC 8 发送缺陷；已验证的 Git revision 修复了它。Cargo 不会向消费方传递本库的 patch。
+
+## C17 接入
+
+将这个仓库的固定提交放在父工程的 `3rd/odrive-can-driver`，在能继承目标 CPU 和浮点 ABI 的 CMake 目录中引入。以下示例假定父工程已有名为 `firmware` 的目标，要求 CMake 3.21 或更高版本。
+
+```cmake
+add_subdirectory("${PROJECT_SOURCE_DIR}/3rd/odrive-can-driver"
+                 "${CMAKE_CURRENT_BINARY_DIR}/odrive-can-driver")
+target_link_libraries(firmware PRIVATE odrive_can_driver::odrive_can_driver)
+```
+
+| C 头文件 | 用法 |
+|---|---|
+| [fw_v0_5_1.h](c/include/odrive_can_driver/fw_v0_5_1.h) | `odrive_can_v051_encode` / `odrive_can_v051_decode` 支持主机命令、RTR 和设备回复。以 `#include <odrive_can_driver/fw_v0_5_1.h>` 引入。 |
+| [response_cache.h](c/include/odrive_can_driver/response_cache.h) | 每个节点各建一个缓存。解码得到回复后，使用 `odrive_can_cache_record` 写入原始值和接收时刻。 |
+| [driver.h](c/include/odrive_can_driver/driver.h) | 按会话跟踪一次操作，处理发送资格、候选回复和报告。时间统一使用同一单调时钟域中的微秒值。 |
+
+**周期控制。** 让一个发送者决定本周期发送什么。它可以发出测速 RTR，在回复仍未到达的下一周期发送零速或 Idle；接收到的每一类回复独立更新原始缓存。同类旧样本不会覆盖较新样本，同一微秒的后到样本覆盖前一个。新收到的观测是否足以确认某次使能，由应用判断。[C 周期收发示例](c/examples/periodic.c) · [Rust 独立缓存示例](examples/encode_decode.rs)
+
+**顺序操作。** C 应用初始化 Driver 时提供非零实例编号。只要旧句柄还可能被使用，新建或原址重建的实例就必须使用不同编号。初始化后的 Driver 由一个所有者串行推进。每次真实发送前检查授权，已结束且确定未入队的 `WouldBlock` 会签发新凭证；无法判定是否入队时应回填未知，并处理原发送和硬件队列。候选回复由应用显式接纳。示例使用模拟收发端点，展示完整调用顺序。[C 非阻塞 Driver 示例](c/examples/driver_poll.c)
+
+对于支持的固件，发往节点的查询也可能喂 watchdog。编码产生的 RTR 帧保留 DLC 8、零有效载荷，以及供 HAL 读取的八字节缓冲。接收时，Classic 数据帧按 `data_len` 解码，RTR 按 `dlc` 解码。如果应用需要识别异常的原始 DLC，应在构造协议视图前检查控制器给出的值。[C 帧视图](c/include/odrive_can_driver/fw_v0_5_1.h) · [协议支持范围](#协议支持范围)
 
 ## 只使用协议编解码
 
@@ -99,7 +125,9 @@ use odrive_can_driver::protocol::{encode, Command, NodeId};
 
 ### 时间合同
 
-所有准备、轮询、提交、接收、期限、缓存和报告统一使用 `Instant`（微秒时间点），时间跨度使用 `Duration`。用 `Instant::from_micros(value)` / `Duration::from_micros(value)` 显式构造，`as_micros()` 读取原值。绝对期限不包含期限本身。
+两种实现使用相同的单调微秒时钟，绝对期限不包含期限本身。Rust 的时间点和时间跨度分别用 `Instant::from_micros(value)` 和 `Duration::from_micros(value)` 构造，`as_micros()` 读取原值。C 入口接收 `uint64_t` 微秒值。
+
+发送尝试尚未回填时，`authorize_tx` 或 `tick` 中先观察到到期的一方将报告置为 `Unknown`，并把当次处理时刻记入 `terminal_at`。后续轮询仍被拒绝，应用仍可回填一次实际发送结果。
 
 事件时间与处理时间分开：`occurred_at` / `received_at` 表示本地提交结果或接收事件，`processed_at` 表示状态机处理结果的时间。它们必须映射到同一个单调时钟域，但允许事件早于处理时间；迟到回填不等于时钟回退。后端在真实 I/O 返回后才采样结果时间。处理时钟回退会被拒绝，不能通过倒退时间延长发送资格。相同微秒值不能证明两个事件的因果顺序，因此查询要求 RX 严格晚于提交；等时刻帧仍保留在缓存中。
 
@@ -117,7 +145,7 @@ Embassy 返回完整 `FdEnvelope`，包括原生 `ts`；映射到 Driver 时间�
 
 查询反馈先于 TX 结果回填到达时，可先保存为候选；回填真实提交时间后再进行时间匹配和应用接纳。不会从旧缓存自动完成新查询。每个操作只保留最新事件时间的候选，更旧的迟到帧不会替换它；应用需要逐帧审查时，应在分发每一帧后立即处理候选。
 
-`tick` 已报告查询超时时，事件时间仍在有效窗口内的延迟 RX/TX 可以继续参与接纳，直到应用 `take_report` 最终取走报告；取走之后不再追溯修改。应用取消或明确拒绝后不会被后续反馈恢复。应用负责旧帧隔离、来源连续性、接收队列水位等总线规则。CANSimple 没有请求序号，所以 `Observed` 只是符合规则的观察关联，不是因果 ACK。
+已提交查询被 `tick` 标记为 `TimedOut` 后，应用仍可接纳在有效窗口内收到、稍后才处理的回复。此时调用 `cancel` 会返回成功并保持暂定超时状态。要最终关闭这个窗口，调用 `take_report` 取走报告。已进入 `Cancelled` 或 `Rejected` 的查询也已关闭接纳。CANSimple 的回复没有请求序号，`Observed` 表示应用接纳了时间和类型均匹配的观测。应用负责旧帧隔离、来源连续性和接收队列管理。
 
 ```mermaid
 sequenceDiagram
@@ -318,4 +346,4 @@ cargo run --features socketcan --example socketcan -- can0 1 idle
 
 MKS 结论仅覆盖表中的固定源码包：其中 CANSimple 源码与上述 ODrive 基线一致，因此不需要 MKS 专用 feature 或转换层。其他 ODrive 或 MKS 固件版本必须先核对对应源码，不能由本表推断兼容性。
 
-完整 API 合同见 [rustdoc](https://docs.rs/odrive_can_driver)，贡献说明见 [CONTRIBUTING.md](CONTRIBUTING.md)。本项目采用 [MIT License](LICENSE)。
+发布的 Rust API 可查阅 [rustdoc](https://docs.rs/odrive_can_driver)。当前源码中的 Rust API 可用 `cargo doc --no-deps` 生成，C API 的 Doxygen 注释随[公开头文件](c/include/odrive_can_driver/)提供。构建与验证命令见[贡献指南](CONTRIBUTING.md)。本项目采用 [MIT License](LICENSE)。

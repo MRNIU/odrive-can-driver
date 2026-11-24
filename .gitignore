@@ -1,4 +1,5 @@
 # Copyright The odrive-can-driver Contributors
 # 排除构建产物和环境变量文件。
 /target/
+/build/
 .env

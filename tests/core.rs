@@ -1,8 +1,9 @@
 // Copyright The odrive-can-driver Contributors
-//! Core timing and ownership regression tests.
+//! 核心状态机的时序与所有权回归测试。
 
 use odrive_can_driver::{
-    Driver, Instant, OperationState, ResponseKind, Session, TxCompletion, TxOutcome,
+    Driver, Duration, Instant, OperationState, ResponseCache, ResponseKind, Session, TxCompletion,
+    TxOutcome,
     protocol::{self, Command, NodeId, Query, Response},
 };
 
@@ -93,16 +94,35 @@ fn rejection_ends_query_without_erasing_submission() {
 
 #[test]
 fn deadline_revokes_gate_but_preserves_unknown_slot() {
-    let mut session = Session::new();
-    let mut driver = Driver::new(&mut session, node());
-    let permit = driver
-        .prepare_command(Command::ClearErrors, at(1), at(10))
-        .unwrap();
-    let id = permit.id();
-    let attempt = driver.begin_send(permit, at(2)).unwrap();
-    driver.tick(at(10)).unwrap();
-    assert_eq!(driver.report(id).unwrap().state, OperationState::Unknown);
-    assert!(driver.authorize_tx(&attempt, at(11)).is_err());
+    for authorize_first in [true, false] {
+        let mut session = Session::new();
+        let mut driver = Driver::new(&mut session, node());
+        let permit = driver
+            .prepare_command(Command::ClearErrors, at(1), at(10))
+            .unwrap();
+        let id = permit.id();
+        let attempt = driver.begin_send(permit, at(2)).unwrap();
+
+        if authorize_first {
+            assert!(driver.authorize_tx(&attempt, at(11)).is_err());
+        } else {
+            driver.tick(at(11)).unwrap();
+        }
+        let report = driver.report(id).unwrap();
+        assert_eq!(report.state, OperationState::Unknown);
+        assert_eq!(report.terminal_at, Some(at(11)));
+
+        assert!(driver.authorize_tx(&attempt, at(12)).is_err());
+        let report = driver.report(id).unwrap();
+        assert_eq!(report.terminal_at, Some(at(11)));
+        assert_eq!(report.processed_at, at(12));
+
+        assert!(driver.authorize_tx(&attempt, at(11)).is_err());
+        let report = driver.report(id).unwrap();
+        assert_eq!(report.terminal_at, Some(at(11)));
+        assert_eq!(report.processed_at, at(12));
+        assert!(driver.take_report(id).is_err());
+    }
 }
 
 #[test]
@@ -124,6 +144,77 @@ fn cache_preserves_timestamp_and_error_bits() {
         }
     );
     assert_eq!(driver.cache().heartbeat_age(at(25)).unwrap().as_micros(), 5);
+}
+
+#[test]
+fn standalone_cache_records_latest_observation_per_response_kind() {
+    let mut cache = ResponseCache::default();
+    let samples = [
+        (
+            ResponseKind::Heartbeat,
+            Response::Heartbeat {
+                axis_error: 0x8000_0001,
+                axis_state: protocol::AxisState(0x0001_0008),
+            },
+        ),
+        (ResponseKind::MotorError, Response::MotorError(1)),
+        (ResponseKind::EncoderError, Response::EncoderError(2)),
+        (ResponseKind::SensorlessError, Response::SensorlessError(3)),
+        (
+            ResponseKind::EncoderEstimates,
+            Response::EncoderEstimates {
+                position: 1.0,
+                velocity: -2.0,
+            },
+        ),
+        (
+            ResponseKind::EncoderCount,
+            Response::EncoderCount {
+                shadow_count: -3,
+                count_in_cpr: 4,
+            },
+        ),
+        (
+            ResponseKind::Iq,
+            Response::Iq {
+                setpoint: 5.0,
+                measured: 6.0,
+            },
+        ),
+        (
+            ResponseKind::SensorlessEstimates,
+            Response::SensorlessEstimates {
+                position: 7.0,
+                velocity: 8.0,
+            },
+        ),
+        (ResponseKind::VbusVoltage, Response::VbusVoltage(48.0)),
+    ];
+
+    assert!(cache.heartbeat_age(at(20)).is_none());
+    for (_, response) in samples {
+        cache.record(response, at(20));
+    }
+
+    let same_tick_voltage = Response::VbusVoltage(52.0);
+    cache.record(same_tick_voltage, at(20));
+    cache.record(Response::VbusVoltage(24.0), at(19));
+    for (kind, response) in samples {
+        let expected = if kind == ResponseKind::VbusVoltage {
+            same_tick_voltage
+        } else {
+            response
+        };
+        let cached = cache.get(kind).unwrap();
+        assert_eq!(cached.response, expected);
+        assert_eq!(cached.received_at, at(20));
+    }
+
+    assert!(cache.heartbeat_age(at(19)).is_none());
+    assert!(!cache.heartbeat_is_fresh(at(19), Duration::from_micros(5)));
+    assert_eq!(cache.heartbeat_age(at(25)), Some(Duration::from_micros(5)));
+    assert!(cache.heartbeat_is_fresh(at(25), Duration::from_micros(5)));
+    assert!(!cache.heartbeat_is_fresh(at(26), Duration::from_micros(5)));
 }
 
 #[test]
@@ -160,13 +251,22 @@ fn acknowledged_old_attempt_cannot_authorize_after_new_operation() {
     let attempt = driver.begin_send(permit, at(2)).unwrap();
     driver.cancel(id, at(3)).unwrap();
     driver.acknowledge_unknown(id).unwrap();
+    assert_eq!(
+        driver.authorize_tx(&attempt, at(3)),
+        Err(odrive_can_driver::AttemptError::Revoked(
+            OperationState::Unknown
+        ))
+    );
     driver.take_report(id).unwrap();
     let next = driver
         .prepare_command(Command::ClearErrors, at(4), at(100))
         .unwrap();
     let next_id = next.id();
     assert_ne!(id.get(), next_id.get());
-    assert!(driver.authorize_tx(&attempt, at(4)).is_err());
+    assert_eq!(
+        driver.authorize_tx(&attempt, at(4)),
+        Err(odrive_can_driver::AttemptError::StaleAttempt)
+    );
 }
 
 #[test]
@@ -348,8 +448,7 @@ fn cancellation_racing_with_same_microsecond_submission_preserves_the_submission
     let id = permit.id();
     let attempt = driver.begin_send(permit, at(2)).unwrap();
     driver.authorize_tx(&attempt, at(3)).unwrap();
-    // A native synchronous call completed before cancellation was processed, but both clocks
-    // have the same microsecond value. Its result was backfilled only afterward.
+    // 底层同步调用先完成，取消随后处理，两者时刻落在同一微秒。提交结果最后才回填。
     driver.cancel(id, at(4)).unwrap();
     driver
         .finish_tx(attempt, TxOutcome::Submitted { occurred_at: at(4) }, at(5))

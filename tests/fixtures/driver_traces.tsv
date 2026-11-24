@@ -1,0 +1,128 @@
+# Copyright The odrive-can-driver Contributors
+# 每个用例创建一个节点号为 7 的 Driver。时间为整数微秒。
+# prepare 依次给出操作类型、准备时刻和截止时刻。rx 依次给出接收时刻和十进制 MotorError 错误位。
+# gate、submit、block 和 take 在调用参数后给出预期结果。
+# peek 给出候选的接收时刻和 MotorError 错误位。没有候选时两列都填短横线。
+# report 和成功的 take 按下列顺序填写预期报告字段。
+#   状态、准备时刻、截止时刻、派发时刻、提交时刻、发送事件时刻、请求取消时刻、终态时刻、处理时刻、接收时刻、MotorError 错误位
+# 短横线表示缺省值。成功取走报告后可用 missing 检查原操作是否已释放。
+case	rx_before_tx_backfill
+prepare	query	1	100
+begin	2
+gate	3	ok
+rx	12	2147483649
+peek	-	-
+submit	10	20	ok
+peek	12	2147483649
+accept	21
+take	Observed	1	100	2	10	10	-	12	21	12	2147483649
+missing
+case	submit_and_cancel_at_same_time
+prepare	command	1	30
+begin	2
+gate	3	ok
+cancel	4
+report	Unknown	1	30	2	-	-	4	4	4	-	-
+submit	4	5	ok
+take	Submitted	1	30	2	4	4	4	4	5	-	-
+case	rollback_keeps_submission
+prepare	command	5	100
+begin	6
+gate	6	ok
+submit	7	4	rollback
+report	Unknown	5	100	6	7	7	-	6	6	-	-
+take	unknown_pending
+ack
+take	Unknown	5	100	6	7	7	-	6	6	-	-
+case	late_processing_accepts_in_window_rx
+prepare	query	1	10
+begin	2
+gate	2	ok
+submit	3	4	ok
+tick	10
+report	TimedOut	1	10	2	3	3	-	10	10	-	-
+rx	5	9
+peek	5	9
+accept	11
+take	Observed	1	10	2	3	3	-	5	11	5	9
+case	cancel_after_tentative_timeout_preserves_acceptance_window
+prepare	query	1	10
+begin	2
+gate	2	ok
+submit	3	4	ok
+tick	10
+cancel	11
+report	TimedOut	1	10	2	3	3	-	10	10	-	-
+rx	5	9
+peek	5	9
+accept	12
+take	Observed	1	10	2	3	3	-	5	12	5	9
+missing
+case	take_finalizes_timeout
+prepare	query	1	10
+begin	2
+gate	2	ok
+submit	3	4	ok
+tick	10
+take	TimedOut	1	10	2	3	3	-	10	10	-	-
+rx	5	9
+missing
+case	gate_first_at_deadline
+prepare	command	1	10
+begin	2
+gate	10	revoked
+report	Unknown	1	10	2	-	-	-	10	10	-	-
+gate	11	revoked
+report	Unknown	1	10	2	-	-	-	10	11	-	-
+take	unknown_pending
+ack
+take	Unknown	1	10	2	-	-	-	10	11	-	-
+case	tick_first_at_deadline
+prepare	command	1	10
+begin	2
+tick	10
+report	Unknown	1	10	2	-	-	-	10	10	-	-
+gate	11	revoked
+report	Unknown	1	10	2	-	-	-	10	11	-	-
+take	unknown_pending
+ack
+take	Unknown	1	10	2	-	-	-	10	11	-	-
+case	exclusive_query_window
+prepare	query	1	10
+begin	2
+gate	2	ok
+submit	3	4	ok
+rx	3	1
+rx	10	2
+peek	-	-
+rx	7	3
+rx	6	4
+peek	7	3
+accept	10
+take	Observed	1	10	2	3	3	-	7	10	7	3
+case	would_block_gets_new_attempt
+prepare	command	1	100
+begin	2
+gate	3	ok
+block	3	4	retry
+report	Prepared	1	100	2	-	3	-	-	4	-	-
+begin	5
+gate	6	ok
+submit	6	7	ok
+take	Submitted	1	100	5	6	6	-	6	7	-	-
+case	would_block_after_cancel
+prepare	query	1	100
+begin	2
+gate	2	ok
+cancel	3
+block	4	4	failed
+take	Cancelled	1	100	2	-	4	3	3	4	-	-
+case	submission_at_deadline_remains_unknown
+prepare	command	1	10
+begin	2
+gate	9	ok
+submit	10	11	late
+report	Unknown	1	10	2	10	10	-	11	11	-	-
+take	unknown_pending
+ack
+take	Unknown	1	10	2	10	10	-	11	11	-	-
